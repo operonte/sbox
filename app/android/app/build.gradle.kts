@@ -6,7 +6,8 @@ plugins {
 
 android {
     namespace = "com.sbox.sbox"
-    compileSdk = flutter.compileSdkVersion
+    // file_picker → flutter_plugin_android_lifecycle exige compileSdk 36.
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
