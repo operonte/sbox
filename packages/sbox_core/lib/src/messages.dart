@@ -20,7 +20,7 @@ class SboxMessage {
 
   /// El host acepta (ok=true) o rechaza (ok=false) al cliente.
   factory SboxMessage.welcome({required bool ok, String? device}) =>
-      SboxMessage(SboxMsgType.welcome, {'ok': ok, if (device != null) 'device': device});
+      SboxMessage(SboxMsgType.welcome, {'ok': ok, 'device': ?device});
 
   String? get content => data['content'] as String?;
   String? get code => data['code'] as String?;

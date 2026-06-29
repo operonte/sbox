@@ -3,19 +3,20 @@ import 'package:window_manager/window_manager.dart';
 
 import 'platform.dart';
 import 'sbox_home.dart';
+import 'settings.dart';
 import 'theme.dart';
+import 'window_state.dart';
 
 /// sbox — portapapeles universal PC ↔ Android por la misma WiFi, sin servidor.
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Settings.instance.load();
 
   if (isDesktop) {
     await windowManager.ensureInitialized();
     const options = WindowOptions(
-      size: Size(360, 480),
-      minimumSize: Size(320, 420),
-      center: true,
+      minimumSize: Size(300, 360),
       backgroundColor: Colors.transparent,
       titleBarStyle: TitleBarStyle.hidden,
       windowButtonVisibility: false,
@@ -23,13 +24,17 @@ Future<void> main() async {
     );
     await windowManager.waitUntilReadyToShow(options, () async {
       await windowManager.setAsFrameless();
+      await windowManager.setResizable(true);
       try {
         await windowManager.setHasShadow(false);
       } catch (_) {}
       await windowManager.setAlwaysOnTop(true);
+      // Posición/tamaño: última guardada, o esquina superior izquierda.
+      await WindowState.restoreOrDefault();
       await windowManager.show();
       await windowManager.focus();
     });
+    windowManager.addListener(WindowStateSaver());
   }
 
   runApp(const SboxApp());
@@ -51,6 +56,19 @@ class SboxApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
       ),
+      // Escala de texto global ajustable desde Configuración (1×…4×).
+      builder: (context, child) {
+        return ValueListenableBuilder<double>(
+          valueListenable: Settings.instance.textScale,
+          builder: (context, scale, _) {
+            return MediaQuery(
+              data: MediaQuery.of(context)
+                  .copyWith(textScaler: TextScaler.linear(scale)),
+              child: child!,
+            );
+          },
+        );
+      },
       home: const SboxHome(),
     );
   }

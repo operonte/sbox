@@ -70,6 +70,7 @@ class SboxHost implements PeerLink {
   /// Arranca el servidor. Devuelve el puerto usado.
   Future<int> start({int port = kSboxPort}) async {
     _server = await HttpServer.bind(InternetAddress.anyIPv4, port, shared: true);
+    _log('host escuchando en 0.0.0.0:${_server!.port} (código $code)');
     _state.add(PeerState.listening);
     _server!.listen((req) async {
       if (!WebSocketTransformer.isUpgradeRequest(req)) {
@@ -86,26 +87,43 @@ class SboxHost implements PeerLink {
   void _attach(WebSocket ws) {
     _peer?.close();
     _peer = ws;
+    _log('teléfono abrió el socket; esperando código…');
     ws.listen(
       (raw) {
         final msg = SboxMessage.tryDecode(raw as String);
         if (msg == null) return;
         if (msg.type == SboxMsgType.hello) {
           if (msg.code != code) {
+            _log('código equivocado: "${msg.code}" (esperaba "$code")');
             ws.add(SboxMessage.welcome(ok: false).encode());
             ws.close();
             return;
           }
+          _log('EMPAREJADO con ${msg.device}');
           ws.add(SboxMessage.welcome(ok: true, device: deviceName).encode());
           _state.add(PeerState.connected(msg.device ?? 'dispositivo'));
+        } else if (msg.type == SboxMsgType.text) {
+          _log('texto recibido (${msg.content?.length ?? 0} chars)');
+          _messages.add(msg);
         } else if (msg.type != SboxMsgType.ping) {
           _messages.add(msg);
         }
       },
-      onDone: _onPeerGone,
-      onError: (_) => _onPeerGone(),
+      onDone: () {
+        _log('teléfono desconectado');
+        _onPeerGone();
+      },
+      onError: (e) {
+        _log('error de socket: $e');
+        _onPeerGone();
+      },
       cancelOnError: true,
     );
+  }
+
+  void _log(String m) {
+    // ignore: avoid_print
+    print('[sbox-host] $m');
   }
 
   void _onPeerGone() {

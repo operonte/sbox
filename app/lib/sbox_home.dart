@@ -8,6 +8,8 @@ import 'package:window_manager/window_manager.dart';
 
 import 'discovery.dart';
 import 'platform.dart';
+import 'settings.dart';
+import 'settings_screen.dart';
 import 'theme.dart';
 
 /// La caja sbox: en escritorio actúa de host (muestra código + IP); en Android
@@ -57,6 +59,19 @@ class _SboxHomeState extends State<SboxHome> {
     }
   }
 
+  /// Nombre con el que este equipo se anuncia (configurable; con defecto).
+  String _myName() {
+    final custom = Settings.instance.deviceName.value.trim();
+    if (custom.isNotEmpty) return custom;
+    return isDesktop ? 'PC' : 'Android';
+  }
+
+  void _openSettings() {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const SettingsScreen()),
+    );
+  }
+
   void _listen(PeerLink link) {
     _stateSub?.cancel();
     _msgSub?.cancel();
@@ -74,14 +89,14 @@ class _SboxHomeState extends State<SboxHome> {
 
   Future<void> _startHost() async {
     _code = (100000 + Random().nextInt(900000)).toString();
-    final host = SboxHost(code: _code, deviceName: 'PC');
+    final host = SboxHost(code: _code, deviceName: _myName());
     _host = host;
     _listen(host);
     _port = await host.start();
     _ips = await localIPv4();
     _advertiser = SboxAdvertiser();
     try {
-      await _advertiser!.start(port: _port, deviceLabel: 'PC');
+      await _advertiser!.start(port: _port, deviceLabel: _myName());
     } catch (_) {
       // mDNS es opcional: si falla, queda el emparejamiento por IP manual.
     }
@@ -89,7 +104,7 @@ class _SboxHomeState extends State<SboxHome> {
   }
 
   Future<void> _startBrowsing() async {
-    _client = SboxClient(deviceName: 'Android');
+    _client = SboxClient(deviceName: _myName());
     _listen(_client!);
     _browser = SboxBrowser();
     _hostSub = _browser!.hosts.listen((h) {
@@ -197,15 +212,22 @@ class _SboxHomeState extends State<SboxHome> {
         child: Padding(
           padding: const EdgeInsets.all(8),
           child: Container(
+            clipBehavior: Clip.antiAlias,
             decoration: BoxDecoration(
               color: cCard.withValues(alpha: 0.94),
               borderRadius: BorderRadius.circular(22),
               border: Border.all(color: cBorder),
             ),
-            child: Column(
+            child: Stack(
               children: [
-                _header(),
-                Expanded(child: _body()),
+                Column(
+                  children: [
+                    _header(),
+                    Expanded(child: _body()),
+                  ],
+                ),
+                if (isDesktop)
+                  Positioned(right: 0, bottom: 0, child: _resizeGrip()),
               ],
             ),
           ),
@@ -215,7 +237,7 @@ class _SboxHomeState extends State<SboxHome> {
   }
 
   Widget _header() {
-    return Padding(
+    final header = Padding(
       padding: const EdgeInsets.fromLTRB(16, 14, 10, 8),
       child: Row(
         children: [
@@ -235,12 +257,15 @@ class _SboxHomeState extends State<SboxHome> {
             ),
           ),
           const Spacer(),
+          _iconBtn(Icons.settings, _openSettings),
           if (_connected)
             _iconBtn(Icons.logout, _logout, color: cDanger),
           if (isDesktop) _iconBtn(Icons.close, () => windowManager.close()),
         ],
       ),
     );
+    // En escritorio, arrastrar la cabecera mueve la ventana sin bordes.
+    return isDesktop ? DragToMoveArea(child: header) : header;
   }
 
   Widget _body() {
@@ -525,6 +550,21 @@ class _SboxHomeState extends State<SboxHome> {
     );
   }
 
+  // Agarre para redimensionar la ventana sin bordes (escritorio).
+  Widget _resizeGrip() {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeDownRight,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onPanStart: (_) => windowManager.startResizing(ResizeEdge.bottomRight),
+        child: const Padding(
+          padding: EdgeInsets.fromLTRB(10, 10, 6, 6),
+          child: Icon(Icons.south_east, size: 14, color: cDim),
+        ),
+      ),
+    );
+  }
+
   Widget _pillButton({
     required String label,
     required IconData icon,
@@ -551,14 +591,17 @@ class _SboxHomeState extends State<SboxHome> {
               children: [
                 Icon(icon, size: 16, color: enabled ? cAccent : cDim),
                 const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: TextStyle(
-                    fontFamily: fontMono,
-                    color: enabled ? cAccent : cDim,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.5,
-                    fontSize: 13,
+                Flexible(
+                  child: Text(
+                    label,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontFamily: fontMono,
+                      color: enabled ? cAccent : cDim,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.5,
+                      fontSize: 13,
+                    ),
                   ),
                 ),
               ],

@@ -1,12 +1,15 @@
 import 'package:flutter_test/flutter_test.dart';
-
 import 'package:sbox_core/sbox_core.dart';
 
 void main() {
-  test('adds one to input values', () {
-    final calculator = Calculator();
-    expect(calculator.addOne(2), 3);
-    expect(calculator.addOne(-7), -6);
-    expect(calculator.addOne(0), 1);
+  test('SboxMessage de texto hace round-trip por JSON', () {
+    final decoded =
+        SboxMessage.tryDecode(SboxMessage.text('hola').encode());
+    expect(decoded!.type, SboxMsgType.text);
+    expect(decoded.content, 'hola');
+  });
+
+  test('JSON inválido devuelve null', () {
+    expect(SboxMessage.tryDecode('{no json'), isNull);
   });
 }
