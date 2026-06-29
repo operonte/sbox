@@ -6,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:file_selector/file_selector.dart' as fsel;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:home_widget/home_widget.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sbox_core/sbox_core.dart';
@@ -26,7 +27,7 @@ class SboxHome extends StatefulWidget {
   State<SboxHome> createState() => _SboxHomeState();
 }
 
-class _SboxHomeState extends State<SboxHome> {
+class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   // Enlace activo (host o cliente).
   SboxHost? _host;
   SboxClient? _client;
@@ -52,6 +53,10 @@ class _SboxHomeState extends State<SboxHome> {
   final List<DiscoveredHost> _found = [];
   final _ipCtrl = TextEditingController();
   final _codeCtrl = TextEditingController();
+  // Últimos datos de una conexión exitosa, para reconectar al volver al foco.
+  String? _lastHost;
+  int _lastPort = kSboxPort;
+  String? _lastCode;
 
   // Envío
   final _sendCtrl = TextEditingController();
@@ -64,11 +69,25 @@ class _SboxHomeState extends State<SboxHome> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     if (isDesktop) {
       _startHost();
     } else {
       _startBrowsing();
     }
+  }
+
+  /// Android congela el proceso al perder el foco y el socket muere. Al volver
+  /// a primer plano, si éramos cliente y nos quedamos sin conexión, reconectamos
+  /// con los últimos datos conocidos.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
+    if (lifecycle != AppLifecycleState.resumed || isDesktop) return;
+    if (_connected) return;
+    final host = _lastHost;
+    final code = _lastCode;
+    if (host == null || code == null) return;
+    _client?.connect(host, code: code, port: _lastPort);
   }
 
   /// Nombre con el que este equipo se anuncia (configurable; con defecto).
@@ -90,12 +109,14 @@ class _SboxHomeState extends State<SboxHome> {
     _fileSub?.cancel();
     _stateSub = link.state.listen((s) {
       if (mounted) setState(() => _state = s);
+      _updateWidget();
     });
     _msgSub = link.messages.listen((m) async {
       if (m.type == SboxMsgType.text && m.content != null) {
         if (mounted) setState(() => _shared = m.content);
         // Portapapeles compartido: copiar automáticamente lo recibido.
         await Clipboard.setData(ClipboardData(text: m.content!));
+        _updateWidget();
       }
     });
     _fileSub = link.files.listen(_onFileReceived);
@@ -138,7 +159,11 @@ class _SboxHomeState extends State<SboxHome> {
         ? DiscoveredHost(label: 'PC', ip: manualIp, port: kSboxPort)
         : (_found.isEmpty ? null : _found.first);
     if (host == null) return;
-    _client?.connect(host.ip, code: _codeCtrl.text.trim(), port: host.port);
+    final code = _codeCtrl.text.trim();
+    _lastHost = host.ip;
+    _lastPort = host.port;
+    _lastCode = code;
+    _client?.connect(host.ip, code: code, port: host.port);
   }
 
   void _send(String text) {
@@ -197,8 +222,26 @@ class _SboxHomeState extends State<SboxHome> {
           _recvSize = f.size;
         });
       }
+      _updateWidget(lastText: '📎 ${f.name}');
     } catch (e) {
       _toast('No se pudo guardar el archivo');
+    }
+  }
+
+  /// Empuja el estado y el último contenido al widget de inicio (solo Android).
+  Future<void> _updateWidget({String? lastText}) async {
+    if (isDesktop) return;
+    final last = lastText ?? _shared ?? '';
+    try {
+      await HomeWidget.saveWidgetData<bool>('connected', _connected);
+      await HomeWidget.saveWidgetData<String>(
+        'status',
+        _connected ? 'Conectado · ${_state.peerName ?? ''}' : 'Desconectado',
+      );
+      await HomeWidget.saveWidgetData<String>('lastText', last);
+      await HomeWidget.updateWidget(androidName: 'SboxWidgetProvider');
+    } catch (_) {
+      // El widget es opcional: si falla la actualización, no rompe la app.
     }
   }
 
@@ -278,6 +321,7 @@ class _SboxHomeState extends State<SboxHome> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _stateSub?.cancel();
     _msgSub?.cancel();
     _fileSub?.cancel();
