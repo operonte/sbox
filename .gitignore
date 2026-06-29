@@ -1,0 +1,18 @@
+# OS / editor
+.DS_Store
+*.swp
+*~
+
+# Artefactos de build (las subcarpetas de Flutter tienen su propio .gitignore,
+# esto es una red de seguridad a nivel raíz)
+**/build/
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+
+# Secretos / firma de Android (nunca subir)
+**/key.properties
+*.jks
+*.keystore
+.env
+.env.*
