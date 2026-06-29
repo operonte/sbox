@@ -1,5 +1,5 @@
-/// A Calculator.
-class Calculator {
-  /// Returns [value] plus 1.
-  int addOne(int value) => value + 1;
-}
+/// Lógica compartida de sbox: protocolo y enlace LAN entre las dos cajas.
+library sbox_core;
+
+export 'src/messages.dart';
+export 'src/peer_link.dart';

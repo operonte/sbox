@@ -1,30 +1,35 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-
-import 'package:sbox/main.dart';
+import 'package:sbox_core/sbox_core.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  test('SboxMessage de texto hace round-trip por JSON', () {
+    final original = SboxMessage.text('hola desde la PC');
+    final decoded = SboxMessage.tryDecode(original.encode());
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    expect(decoded, isNotNull);
+    expect(decoded!.type, SboxMsgType.text);
+    expect(decoded.content, 'hola desde la PC');
+  });
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
+  test('hello transporta código y dispositivo', () {
+    final decoded = SboxMessage.tryDecode(
+      SboxMessage.hello(code: '482193', device: 'Android').encode(),
+    );
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(decoded!.type, SboxMsgType.hello);
+    expect(decoded.code, '482193');
+    expect(decoded.device, 'Android');
+  });
+
+  test('welcome lleva el flag ok', () {
+    final ok = SboxMessage.tryDecode(SboxMessage.welcome(ok: true).encode());
+    final no = SboxMessage.tryDecode(SboxMessage.welcome(ok: false).encode());
+
+    expect(ok!.ok, isTrue);
+    expect(no!.ok, isFalse);
+  });
+
+  test('JSON inválido devuelve null en vez de lanzar', () {
+    expect(SboxMessage.tryDecode('no soy json'), isNull);
   });
 }
