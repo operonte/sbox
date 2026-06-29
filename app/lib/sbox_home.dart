@@ -1,8 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
+import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart' as fsel;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:open_filex/open_filex.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:sbox_core/sbox_core.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -30,6 +35,12 @@ class _SboxHomeState extends State<SboxHome> {
   PeerState _state = PeerState.idle;
   String? _shared; // último texto compartido (lo que viaja entre cajas)
 
+  // Último archivo recibido (efímero: solo el último).
+  String? _recvName;
+  String? _recvPath;
+  int _recvSize = 0;
+  bool _sending = false;
+
   // Host (PC)
   String _code = '';
   int _port = kSboxPort;
@@ -47,6 +58,7 @@ class _SboxHomeState extends State<SboxHome> {
 
   StreamSubscription<PeerState>? _stateSub;
   StreamSubscription<SboxMessage>? _msgSub;
+  StreamSubscription<ReceivedFile>? _fileSub;
   StreamSubscription<DiscoveredHost>? _hostSub;
 
   @override
@@ -75,6 +87,7 @@ class _SboxHomeState extends State<SboxHome> {
   void _listen(PeerLink link) {
     _stateSub?.cancel();
     _msgSub?.cancel();
+    _fileSub?.cancel();
     _stateSub = link.state.listen((s) {
       if (mounted) setState(() => _state = s);
     });
@@ -85,6 +98,7 @@ class _SboxHomeState extends State<SboxHome> {
         await Clipboard.setData(ClipboardData(text: m.content!));
       }
     });
+    _fileSub = link.files.listen(_onFileReceived);
   }
 
   Future<void> _startHost() async {
@@ -139,9 +153,104 @@ class _SboxHomeState extends State<SboxHome> {
     if (text != null && text.isNotEmpty) _send(text);
   }
 
+  // ----------------------------------------------------------------- archivos
+  /// Elige un archivo (cualquier tipo) y lo envía al otro dispositivo.
+  /// En escritorio usa el diálogo GTK nativo; en Android el selector del sistema.
+  Future<void> _pickAndSendFile() async {
+    if (!_connected || _sending) return;
+    final String name;
+    final Uint8List bytes;
+    try {
+      if (isDesktop) {
+        final picked = await fsel.openFile();
+        if (picked == null) return;
+        name = picked.name;
+        bytes = await picked.readAsBytes();
+      } else {
+        final result = await FilePicker.platform.pickFiles(withData: true);
+        final data = result?.files.single.bytes;
+        if (result == null || data == null) return;
+        name = result.files.single.name;
+        bytes = data;
+      }
+    } catch (e) {
+      _toast('No se pudo leer el archivo');
+      return;
+    }
+    setState(() => _sending = true);
+    _link?.sendFile(name, bytes);
+    if (mounted) setState(() => _sending = false);
+    _toast('Enviado: $name');
+  }
+
+  /// Guarda un archivo recibido (Descargas en PC / almacenamiento de la app en
+  /// Android) y lo deja listo para abrir.
+  Future<void> _onFileReceived(ReceivedFile f) async {
+    try {
+      final dir = await _incomingDir();
+      final path = await _uniquePath(dir, f.name);
+      await File(path).writeAsBytes(f.bytes, flush: true);
+      if (mounted) {
+        setState(() {
+          _recvName = f.name;
+          _recvPath = path;
+          _recvSize = f.size;
+        });
+      }
+    } catch (e) {
+      _toast('No se pudo guardar el archivo');
+    }
+  }
+
+  Future<String> _incomingDir() async {
+    if (isDesktop) {
+      final d = await getDownloadsDirectory();
+      return d?.path ?? '${Platform.environment['HOME']}/Descargas';
+    }
+    final d = await getApplicationDocumentsDirectory();
+    return d.path;
+  }
+
+  /// Evita pisar archivos: «foto.png» → «foto (1).png» si ya existe.
+  Future<String> _uniquePath(String dir, String name) async {
+    if (!await File('$dir/$name').exists()) return '$dir/$name';
+    final dot = name.lastIndexOf('.');
+    final base = dot > 0 ? name.substring(0, dot) : name;
+    final ext = dot > 0 ? name.substring(dot) : '';
+    var i = 1;
+    while (await File('$dir/$base ($i)$ext').exists()) {
+      i++;
+    }
+    return '$dir/$base ($i)$ext';
+  }
+
+  Future<void> _openReceived() async {
+    final path = _recvPath;
+    if (path == null) return;
+    if (isDesktop) {
+      await Process.run('xdg-open', [path]);
+    } else {
+      await OpenFilex.open(path);
+    }
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
+    );
+  }
+
+  static String _fmtSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
   Future<void> _logout() async {
     await _stateSub?.cancel();
     await _msgSub?.cancel();
+    await _fileSub?.cancel();
     await _hostSub?.cancel();
     await _advertiser?.stop();
     await _browser?.stop();
@@ -157,6 +266,8 @@ class _SboxHomeState extends State<SboxHome> {
     setState(() {
       _state = PeerState.idle;
       _shared = null;
+      _recvName = null;
+      _recvPath = null;
     });
     if (isDesktop) {
       _startHost();
@@ -169,6 +280,7 @@ class _SboxHomeState extends State<SboxHome> {
   void dispose() {
     _stateSub?.cancel();
     _msgSub?.cancel();
+    _fileSub?.cancel();
     _hostSub?.cancel();
     _advertiser?.stop();
     _browser?.stop();
@@ -438,6 +550,10 @@ class _SboxHomeState extends State<SboxHome> {
               ),
             ],
           ),
+          if (_recvName != null) ...[
+            const SizedBox(height: 12),
+            _receivedFileCard(),
+          ],
           const SizedBox(height: 12),
           Expanded(
             child: Container(
@@ -464,6 +580,11 @@ class _SboxHomeState extends State<SboxHome> {
           const SizedBox(height: 12),
           Row(
             children: [
+              _iconBtn(
+                _sending ? Icons.hourglass_top : Icons.attach_file,
+                _pickAndSendFile,
+                color: cAccent,
+              ),
               Expanded(
                 child: TextField(
                   controller: _sendCtrl,
@@ -546,6 +667,47 @@ class _SboxHomeState extends State<SboxHome> {
       child: Padding(
         padding: const EdgeInsets.all(8),
         child: Icon(icon, size: 18, color: color),
+      ),
+    );
+  }
+
+  // Tarjeta del último archivo recibido, con botón para abrirlo.
+  Widget _receivedFileCard() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: cOnline.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: cOnline.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.insert_drive_file, color: cOnline, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _recvName!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                Text(
+                  'Recibido · ${_fmtSize(_recvSize)}',
+                  style: const TextStyle(color: cDim, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          _iconBtn(Icons.open_in_new, _openReceived, color: cOnline),
+        ],
       ),
     );
   }
