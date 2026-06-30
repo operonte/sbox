@@ -5,14 +5,57 @@
 #include <gdk/gdkx.h>
 #endif
 
+#include <cstring>
+
 #include "flutter/generated_plugin_registrant.h"
 
 struct _MyApplication {
   GtkApplication parent_instance;
   char** dart_entrypoint_arguments;
+  // Canal nativo para leer imágenes del portapapeles vía GTK (sin herramientas
+  // externas como wl-clipboard). Atiende el método "getImagePng".
+  FlMethodChannel* clipboard_channel;
 };
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
+
+// Lee una imagen del portapapeles del sistema con GTK y la devuelve como bytes
+// PNG (o null si no hay imagen). No depende de wl-clipboard ni de nada externo.
+static void clipboard_method_call_cb(FlMethodChannel* channel,
+                                     FlMethodCall* method_call,
+                                     gpointer user_data) {
+  g_autoptr(FlMethodResponse) response = nullptr;
+  if (strcmp(fl_method_call_get_name(method_call), "getImagePng") == 0) {
+    GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    GdkPixbuf* pixbuf = gtk_clipboard_wait_for_image(clipboard);
+    if (pixbuf == nullptr) {
+      response = FL_METHOD_RESPONSE(
+          fl_method_success_response_new(fl_value_new_null()));
+    } else {
+      gchar* buffer = nullptr;
+      gsize buffer_size = 0;
+      g_autoptr(GError) save_error = nullptr;
+      gboolean ok = gdk_pixbuf_save_to_buffer(pixbuf, &buffer, &buffer_size,
+                                              "png", &save_error, nullptr);
+      g_object_unref(pixbuf);
+      if (ok) {
+        g_autoptr(FlValue) result =
+            fl_value_new_uint8_list((const uint8_t*)buffer, buffer_size);
+        g_free(buffer);
+        response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+      } else {
+        response = FL_METHOD_RESPONSE(
+            fl_method_success_response_new(fl_value_new_null()));
+      }
+    }
+  } else {
+    response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  }
+  g_autoptr(GError) error = nullptr;
+  if (!fl_method_call_respond(method_call, response, &error)) {
+    g_warning("sbox clipboard: respuesta fallida: %s", error->message);
+  }
+}
 
 // Called when first Flutter frame received.
 static void first_frame_cb(MyApplication* self, FlView* view) {
@@ -58,6 +101,14 @@ static void my_application_activate(GApplication* application) {
   gtk_widget_realize(GTK_WIDGET(view));
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
+
+  // Canal nativo de portapapeles (imágenes) — usa GTK, ya enlazado.
+  g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+  self->clipboard_channel = fl_method_channel_new(
+      fl_engine_get_binary_messenger(fl_view_get_engine(view)),
+      "sbox/clipboard", FL_METHOD_CODEC(codec));
+  fl_method_channel_set_method_call_handler(
+      self->clipboard_channel, clipboard_method_call_cb, self, nullptr);
 
   gtk_widget_grab_focus(GTK_WIDGET(view));
 }
@@ -105,6 +156,7 @@ static void my_application_shutdown(GApplication* application) {
 static void my_application_dispose(GObject* object) {
   MyApplication* self = MY_APPLICATION(object);
   g_clear_pointer(&self->dart_entrypoint_arguments, g_strfreev);
+  g_clear_object(&self->clipboard_channel);
   G_OBJECT_CLASS(my_application_parent_class)->dispose(object);
 }
 

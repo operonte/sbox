@@ -84,6 +84,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   /// y evita que un video enorme deje sin memoria al teléfono.
   static const int _maxFileBytes = 150 * 1024 * 1024; // 150 MB
 
+  /// Canal hacia el runner nativo de Linux para leer imágenes del portapapeles.
+  static const _clipboardChannel = MethodChannel('sbox/clipboard');
+
   @override
   void initState() {
     super.initState();
@@ -220,39 +223,22 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     if (text != null && text.isNotEmpty) _send(text);
   }
 
-  /// Lee una imagen del portapapeles vía `wl-paste` (Wayland) y la envía como
-  /// archivo. Devuelve true si encontró y envió una imagen; false si no hay
-  /// imagen o si `wl-clipboard` no está instalado (cae a texto).
+  /// Lee una imagen del portapapeles usando el canal nativo GTK del runner (sin
+  /// herramientas externas) y la envía como archivo. Devuelve true si había una
+  /// imagen y se envió; false si no (entonces se envía el texto).
   Future<bool> _sendClipboardImage() async {
     try {
-      final types = await Process.run('wl-paste', ['--list-types']);
-      if (types.exitCode != 0) return false;
-      String? mime;
-      for (final line in (types.stdout as String).split('\n')) {
-        final type = line.trim();
-        if (type == 'image/png') {
-          mime = type;
-          break;
-        }
-        if (mime == null && type.startsWith('image/')) mime = type;
-      }
-      if (mime == null) return false;
-      final out = await Process.run(
-        'wl-paste',
-        ['--type', mime],
-        stdoutEncoding: null, // bytes crudos
-      );
-      final bytes = out.stdout as List<int>;
-      if (out.exitCode != 0 || bytes.isEmpty) return false;
+      final bytes =
+          await _clipboardChannel.invokeMethod<Uint8List>('getImagePng');
+      if (bytes == null || bytes.isEmpty) return false;
       final dir = await getTemporaryDirectory();
-      final ext = mime.split('/').last;
       final path =
-          '${dir.path}/captura_${DateTime.now().millisecondsSinceEpoch}.$ext';
+          '${dir.path}/captura_${DateTime.now().millisecondsSinceEpoch}.png';
       await File(path).writeAsBytes(bytes, flush: true);
       await _sendFilePath(path);
       return true;
     } catch (_) {
-      return false; // wl-paste no disponible → se enviará el texto
+      return false; // sin imagen o canal no disponible → se enviará el texto
     }
   }
 
