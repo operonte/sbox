@@ -9,13 +9,22 @@ const String kSboxServiceType = '_sbox._tcp';
 class SboxAdvertiser {
   BonsoirBroadcast? _broadcast;
 
-  Future<void> start({required int port, String deviceLabel = 'PC'}) async {
+  /// [ip] es la IP real de la WiFi del PC. Se anuncia como atributo para que el
+  /// teléfono se conecte ahí y no a una IP virtual (VPN/VMs) que mDNS resuelva.
+  Future<void> start({
+    required int port,
+    String deviceLabel = 'PC',
+    String? ip,
+  }) async {
     final broadcast = BonsoirBroadcast(
       service: BonsoirService(
         name: 'sbox $deviceLabel',
         type: kSboxServiceType,
         port: port,
-        attributes: {'device': deviceLabel},
+        attributes: {
+          'device': deviceLabel,
+          'ip': ?ip,
+        },
       ),
     );
     await broadcast.initialize();
@@ -57,7 +66,9 @@ class SboxBrowser {
         // Resuelto: ya tenemos la dirección.
         case BonsoirDiscoveryServiceResolvedEvent():
           final service = event.service;
-          final ip = service.hostAddress;
+          // Preferir la IP real que anuncia el PC (atributo 'ip'); si no está,
+          // caer en la que resolvió mDNS (que podría ser una IP virtual).
+          final ip = service.attributes['ip'] ?? service.hostAddress;
           if (ip != null && !_controller.isClosed) {
             _controller.add(DiscoveredHost(
               label: service.attributes['device'] ?? 'PC',

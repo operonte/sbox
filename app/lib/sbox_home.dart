@@ -166,7 +166,11 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _ips = await localIPv4();
     _advertiser = SboxAdvertiser();
     try {
-      await _advertiser!.start(port: _port, deviceLabel: _myName());
+      await _advertiser!.start(
+        port: _port,
+        deviceLabel: _myName(),
+        ip: _primaryIp, // IP real de la WiFi (evita la virtual de VMs/VPN)
+      );
     } catch (_) {
       // mDNS es opcional: si falla, queda el emparejamiento por IP manual.
     }
