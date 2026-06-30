@@ -8,6 +8,9 @@
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28"/>
+    <!-- Servicio en primer plano: mantener la conexión viva en segundo plano.
+         (FOREGROUND_SERVICE, WAKE_LOCK y POST_NOTIFICATIONS los aporta el plugin) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
 
     <application
         android:label="sbox"
@@ -48,6 +51,13 @@
                 <data android:mimeType="*/*"/>
             </intent-filter>
         </activity>
+
+        <!-- Servicio en primer plano (mantiene la conexión en 2º plano).
+             No cambiar el nombre: lo provee flutter_foreground_task. -->
+        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false"/>
 
         <!-- Widget 2×2 de pantalla de inicio: estado + último recibido -->
         <receiver

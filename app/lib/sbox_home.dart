@@ -7,6 +7,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:file_selector/file_selector.dart' as fsel;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:home_widget/home_widget.dart';
 import 'package:media_store_plus/media_store_plus.dart';
 import 'package:open_filex/open_filex.dart';
@@ -75,6 +76,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   final List<String> _pendingSharePaths = [];
   final List<String> _pendingShareTexts = [];
 
+  // Servicio en primer plano (Android): mantiene la conexión viva en 2º plano.
+  bool _bgOn = false;
+
   /// Tope de tamaño por archivo. Es un portapapeles: para fotos/clips va sobrado
   /// y evita que un video enorme deje sin memoria al teléfono.
   static const int _maxFileBytes = 150 * 1024 * 1024; // 150 MB
@@ -86,6 +90,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     if (isDesktop) {
       _startHost();
     } else {
+      _initForegroundTask();
       _startBrowsing();
       _listenShares();
     }
@@ -137,6 +142,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _stateSub = link.state.listen((s) {
       if (mounted) setState(() => _state = s);
       _updateWidget();
+      _syncBgService(s); // mantener vivo el servicio en 2º plano según el estado
       _flushPendingShares(); // si quedaron compartidos en cola, mandarlos ya
     });
     _msgSub = link.messages.listen((m) async {
@@ -399,7 +405,86 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     }
   }
 
+  // -------------------------------------------------- servicio en primer plano
+  /// Configura el canal de la notificación del servicio (una sola vez).
+  void _initForegroundTask() {
+    try {
+      FlutterForegroundTask.init(
+        androidNotificationOptions: AndroidNotificationOptions(
+          channelId: 'sbox_conn',
+          channelName: 'Conexión sbox',
+          channelDescription: 'Mantiene sbox conectado en segundo plano',
+          channelImportance: NotificationChannelImportance.LOW,
+          priority: NotificationPriority.LOW,
+          onlyAlertOnce: true,
+        ),
+        iosNotificationOptions: const IOSNotificationOptions(),
+        foregroundTaskOptions: ForegroundTaskOptions(
+          eventAction: ForegroundTaskEventAction.nothing(),
+          allowWakeLock: true,
+          allowWifiLock: true, // mantener la WiFi despierta para el socket LAN
+          autoRunOnBoot: false,
+          // Si el usuario descarta la app de recientes, se corta el servicio
+          // (la conexión vive en el isolate principal, que muere ahí de todos
+          // modos). Mientras la app esté en 2º plano, sigue viva.
+          stopWithTask: true,
+        ),
+      );
+    } catch (_) {}
+  }
+
+  /// Ajusta el servicio según el estado: lo arranca al conectar y mantiene la
+  /// notificación al día. No lo detiene en caídas: sigue hasta el botón rojo.
+  void _syncBgService(PeerState s) {
+    if (isDesktop) return;
+    final text = switch (s.status) {
+      PeerStatus.connected => 'Conectado · ${s.peerName ?? ''}',
+      PeerStatus.connecting => s.message ?? 'Conectando…',
+      _ => 'Desconectado',
+    };
+    if (s.status == PeerStatus.connected && !_bgOn) {
+      _startBgService(text);
+    } else if (_bgOn) {
+      _updateBgNotification(text);
+    }
+  }
+
+  Future<void> _startBgService(String text) async {
+    try {
+      await FlutterForegroundTask.requestNotificationPermission();
+      if (await FlutterForegroundTask.isRunningService) {
+        _bgOn = true;
+        await _updateBgNotification(text);
+        return;
+      }
+      await FlutterForegroundTask.startService(
+        serviceId: 1747,
+        serviceTypes: const [ForegroundServiceTypes.dataSync],
+        notificationTitle: 'sbox',
+        notificationText: text,
+      );
+      _bgOn = true;
+    } catch (_) {
+      // A prueba de fallos: sin servicio queda la reconexión-al-volver.
+    }
+  }
+
+  Future<void> _updateBgNotification(String text) async {
+    try {
+      await FlutterForegroundTask.updateService(notificationText: text);
+    } catch (_) {}
+  }
+
+  Future<void> _stopBgService() async {
+    if (!_bgOn) return;
+    _bgOn = false;
+    try {
+      await FlutterForegroundTask.stopService();
+    } catch (_) {}
+  }
+
   Future<void> _logout() async {
+    await _stopBgService(); // botón rojo: cortar también el servicio de 2º plano
     await _stateSub?.cancel();
     await _msgSub?.cancel();
     await _fileSub?.cancel();
