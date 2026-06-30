@@ -43,7 +43,6 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   String? _recvName;
   String? _recvPath;
   int _recvSize = 0;
-  bool _recvSaved = false; // ¿ya se copió a Descargas? (evita duplicados)
   bool _sending = false;
 
   // Host (PC)
@@ -242,9 +241,11 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
           _recvName = f.name;
           _recvPath = path;
           _recvSize = f.size;
-          _recvSaved = false;
         });
       }
+      // En Android, copiarlo también a Descargas visible al recibir (en el PC
+      // ya cae directo en ~/Descargas). Así no depende de abrirlo.
+      if (!isDesktop) await _saveToDownloads(path);
       _updateWidget(lastText: '📎 ${f.name}');
     } catch (e) {
       _toast('No se pudo guardar el archivo');
@@ -276,17 +277,13 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   Future<void> _openReceived() async {
     final path = _recvPath;
     if (path == null) return;
+    // En el PC está en ~/Descargas; en Android ya se copió a Descargas/sbox al
+    // recibir. Aquí solo se abre.
     if (isDesktop) {
-      // En el PC ya se guardó en ~/Descargas; solo abrir.
       await Process.run('xdg-open', [path]);
-      return;
+    } else {
+      await OpenFilex.open(path);
     }
-    // En Android: copiarlo a Descargas (visible) la primera vez, y abrir.
-    if (!_recvSaved) {
-      await _saveToDownloads(path);
-      _recvSaved = true;
-    }
-    await OpenFilex.open(path);
   }
 
   /// Copia un archivo a la carpeta Descargas visible (Descargas/sbox) vía
