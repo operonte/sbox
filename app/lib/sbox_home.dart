@@ -6,7 +6,6 @@ import 'package:file_picker/file_picker.dart';
 import 'package:file_selector/file_selector.dart' as fsel;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:home_widget/home_widget.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sbox_core/sbox_core.dart';
@@ -109,14 +108,12 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _fileSub?.cancel();
     _stateSub = link.state.listen((s) {
       if (mounted) setState(() => _state = s);
-      _updateWidget();
     });
     _msgSub = link.messages.listen((m) async {
       if (m.type == SboxMsgType.text && m.content != null) {
         if (mounted) setState(() => _shared = m.content);
         // Portapapeles compartido: copiar automáticamente lo recibido.
         await Clipboard.setData(ClipboardData(text: m.content!));
-        _updateWidget();
       }
     });
     _fileSub = link.files.listen(_onFileReceived);
@@ -222,26 +219,8 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
           _recvSize = f.size;
         });
       }
-      _updateWidget(lastText: '📎 ${f.name}');
     } catch (e) {
       _toast('No se pudo guardar el archivo');
-    }
-  }
-
-  /// Empuja el estado y el último contenido al widget de inicio (solo Android).
-  Future<void> _updateWidget({String? lastText}) async {
-    if (isDesktop) return;
-    final last = lastText ?? _shared ?? '';
-    try {
-      await HomeWidget.saveWidgetData<bool>('connected', _connected);
-      await HomeWidget.saveWidgetData<String>(
-        'status',
-        _connected ? 'Conectado · ${_state.peerName ?? ''}' : 'Desconectado',
-      );
-      await HomeWidget.saveWidgetData<String>('lastText', last);
-      await HomeWidget.updateWidget(androidName: 'SboxWidgetProvider');
-    } catch (_) {
-      // El widget es opcional: si falla la actualización, no rompe la app.
     }
   }
 
