@@ -8,6 +8,7 @@ import 'package:file_selector/file_selector.dart' as fsel;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:home_widget/home_widget.dart';
+import 'package:media_store_plus/media_store_plus.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
@@ -42,6 +43,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   String? _recvName;
   String? _recvPath;
   int _recvSize = 0;
+  bool _recvSaved = false; // ¿ya se copió a Descargas? (evita duplicados)
   bool _sending = false;
 
   // Host (PC)
@@ -240,6 +242,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
           _recvName = f.name;
           _recvPath = path;
           _recvSize = f.size;
+          _recvSaved = false;
         });
       }
       _updateWidget(lastText: '📎 ${f.name}');
@@ -274,9 +277,32 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     final path = _recvPath;
     if (path == null) return;
     if (isDesktop) {
+      // En el PC ya se guardó en ~/Descargas; solo abrir.
       await Process.run('xdg-open', [path]);
-    } else {
-      await OpenFilex.open(path);
+      return;
+    }
+    // En Android: copiarlo a Descargas (visible) la primera vez, y abrir.
+    if (!_recvSaved) {
+      await _saveToDownloads(path);
+      _recvSaved = true;
+    }
+    await OpenFilex.open(path);
+  }
+
+  /// Copia un archivo a la carpeta Descargas visible (Descargas/sbox) vía
+  /// MediaStore. A prueba de fallos: si no se puede, el archivo igual se abre.
+  Future<void> _saveToDownloads(String path) async {
+    try {
+      MediaStore.appFolder = 'sbox';
+      await MediaStore.ensureInitialized();
+      final info = await MediaStore().saveFile(
+        tempFilePath: path,
+        dirType: DirType.download,
+        dirName: DirName.download,
+      );
+      if (info != null) _toast('Guardado en Descargas/sbox');
+    } catch (_) {
+      // Sin acceso a Descargas: se abre desde la copia interna igualmente.
     }
   }
 
