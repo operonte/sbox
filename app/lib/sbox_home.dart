@@ -2,12 +2,15 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:file_selector/file_selector.dart' as fsel;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:home_widget/home_widget.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:sbox_core/sbox_core.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -64,6 +67,16 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   StreamSubscription<SboxMessage>? _msgSub;
   StreamSubscription<ReceivedFile>? _fileSub;
   StreamSubscription<DiscoveredHost>? _hostSub;
+  StreamSubscription<List<SharedMediaFile>>? _shareSub;
+
+  // Compartido por «Compartir → sbox» mientras aún no había conexión (se manda
+  // al conectar). Archivos por ruta y textos/URLs por separado.
+  final List<String> _pendingSharePaths = [];
+  final List<String> _pendingShareTexts = [];
+
+  /// Tope de tamaño por archivo. Es un portapapeles: para fotos/clips va sobrado
+  /// y evita que un video enorme deje sin memoria al teléfono.
+  static const int _maxFileBytes = 150 * 1024 * 1024; // 150 MB
 
   @override
   void initState() {
@@ -73,7 +86,21 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
       _startHost();
     } else {
       _startBrowsing();
+      _listenShares();
     }
+  }
+
+  /// «Compartir → sbox»: lo que el usuario comparte desde otra app (foto, video,
+  /// archivo, texto) llega aquí y se envía al PC (en cuanto haya conexión).
+  void _listenShares() {
+    final intent = ReceiveSharingIntent.instance;
+    // Compartido que ABRIÓ la app.
+    intent.getInitialMedia().then((files) {
+      _onShared(files);
+      intent.reset();
+    });
+    // Compartido mientras la app ya estaba abierta.
+    _shareSub = intent.getMediaStream().listen(_onShared);
   }
 
   /// Android congela el proceso al perder el foco y el socket muere. Al volver
@@ -108,12 +135,15 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _fileSub?.cancel();
     _stateSub = link.state.listen((s) {
       if (mounted) setState(() => _state = s);
+      _updateWidget();
+      _flushPendingShares(); // si quedaron compartidos en cola, mandarlos ya
     });
     _msgSub = link.messages.listen((m) async {
       if (m.type == SboxMsgType.text && m.content != null) {
         if (mounted) setState(() => _shared = m.content);
         // Portapapeles compartido: copiar automáticamente lo recibido.
         await Clipboard.setData(ClipboardData(text: m.content!));
+        _updateWidget();
       }
     });
     _fileSub = link.files.listen(_onFileReceived);
@@ -180,29 +210,22 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   /// En escritorio usa el diálogo GTK nativo; en Android el selector del sistema.
   Future<void> _pickAndSendFile() async {
     if (!_connected || _sending) return;
-    final String name;
-    final Uint8List bytes;
+    String? path;
     try {
       if (isDesktop) {
-        final picked = await fsel.openFile();
-        if (picked == null) return;
-        name = picked.name;
-        bytes = await picked.readAsBytes();
+        path = (await fsel.openFile())?.path;
       } else {
-        final result = await FilePicker.platform.pickFiles(withData: true);
-        final data = result?.files.single.bytes;
-        if (result == null || data == null) return;
-        name = result.files.single.name;
-        bytes = data;
+        final result = await FilePicker.platform.pickFiles();
+        path = result?.files.single.path;
       }
     } catch (e) {
       _toast('No se pudo leer el archivo');
       return;
     }
+    if (path == null) return;
     setState(() => _sending = true);
-    _link?.sendFile(name, bytes);
+    await _sendFilePath(path);
     if (mounted) setState(() => _sending = false);
-    _toast('Enviado: $name');
   }
 
   /// Guarda un archivo recibido (Descargas en PC / almacenamiento de la app en
@@ -219,6 +242,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
           _recvSize = f.size;
         });
       }
+      _updateWidget(lastText: '📎 ${f.name}');
     } catch (e) {
       _toast('No se pudo guardar el archivo');
     }
@@ -269,6 +293,89 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
+  // ----------------------------------------------------- compartir / drag&drop
+  /// Lee un archivo del disco por su ruta y lo envía al otro dispositivo.
+  /// Comprueba el tamaño ANTES de cargarlo en memoria (a prueba de errores).
+  Future<void> _sendFilePath(String path) async {
+    final name = path.split('/').last;
+    try {
+      final file = File(path);
+      if (await file.length() > _maxFileBytes) {
+        _toast('«$name» es muy grande (máx ${_fmtSize(_maxFileBytes)})');
+        return;
+      }
+      _link?.sendFile(name, await file.readAsBytes());
+      _toast('Enviado: $name');
+    } catch (_) {
+      _toast('No se pudo enviar el archivo');
+    }
+  }
+
+  /// Llega contenido por «Compartir → sbox». Si hay conexión, se envía; si no,
+  /// se guarda en cola y se manda al conectar.
+  void _onShared(List<SharedMediaFile> files) {
+    if (files.isEmpty) return;
+    var queued = false;
+    for (final f in files) {
+      // Para texto/URL, `path` trae el contenido en sí.
+      final isText =
+          f.type == SharedMediaType.text || f.type == SharedMediaType.url;
+      if (_connected) {
+        isText ? _send(f.path) : _sendFilePath(f.path);
+      } else {
+        (isText ? _pendingShareTexts : _pendingSharePaths).add(f.path);
+        queued = true;
+      }
+    }
+    if (queued) _toast('Conéctate y se enviará lo compartido');
+  }
+
+  void _flushPendingShares() {
+    if (!_connected) return;
+    if (_pendingShareTexts.isNotEmpty) {
+      final texts = List<String>.from(_pendingShareTexts);
+      _pendingShareTexts.clear();
+      for (final t in texts) {
+        _send(t);
+      }
+    }
+    if (_pendingSharePaths.isNotEmpty) {
+      final paths = List<String>.from(_pendingSharePaths);
+      _pendingSharePaths.clear();
+      for (final p in paths) {
+        _sendFilePath(p);
+      }
+    }
+  }
+
+  /// Arrastrar y soltar archivos sobre el recuadro (escritorio).
+  Future<void> _onDesktopDrop(DropDoneDetails detail) async {
+    if (!_connected) {
+      _toast('Conéctate primero para enviar');
+      return;
+    }
+    for (final file in detail.files) {
+      await _sendFilePath(file.path);
+    }
+  }
+
+  /// Empuja el estado y el último contenido al widget de inicio (solo Android).
+  Future<void> _updateWidget({String? lastText}) async {
+    if (isDesktop) return;
+    final last = lastText ?? _shared ?? '';
+    try {
+      await HomeWidget.saveWidgetData<bool>('connected', _connected);
+      await HomeWidget.saveWidgetData<String>(
+        'status',
+        _connected ? 'Conectado · ${_state.peerName ?? ''}' : 'Desconectado',
+      );
+      await HomeWidget.saveWidgetData<String>('lastText', last);
+      await HomeWidget.updateWidget(androidName: 'SboxWidgetProvider');
+    } catch (_) {
+      // El widget es opcional: si falla la actualización, no rompe la app.
+    }
+  }
+
   Future<void> _logout() async {
     await _stateSub?.cancel();
     await _msgSub?.cancel();
@@ -305,6 +412,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _msgSub?.cancel();
     _fileSub?.cancel();
     _hostSub?.cancel();
+    _shareSub?.cancel();
     _advertiser?.stop();
     _browser?.stop();
     _host?.dispose();
@@ -341,32 +449,34 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    Widget box = Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: cCard.withValues(alpha: 0.94),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: cBorder),
+      ),
+      child: Stack(
+        children: [
+          Column(
+            children: [
+              _header(),
+              Expanded(child: _body()),
+            ],
+          ),
+          if (isDesktop)
+            Positioned(right: 0, bottom: 0, child: _resizeGrip()),
+        ],
+      ),
+    );
+    // En escritorio, soltar archivos sobre el recuadro los envía.
+    if (isDesktop) {
+      box = DropTarget(onDragDone: _onDesktopDrop, child: box);
+    }
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(8),
-          child: Container(
-            clipBehavior: Clip.antiAlias,
-            decoration: BoxDecoration(
-              color: cCard.withValues(alpha: 0.94),
-              borderRadius: BorderRadius.circular(22),
-              border: Border.all(color: cBorder),
-            ),
-            child: Stack(
-              children: [
-                Column(
-                  children: [
-                    _header(),
-                    Expanded(child: _body()),
-                  ],
-                ),
-                if (isDesktop)
-                  Positioned(right: 0, bottom: 0, child: _resizeGrip()),
-              ],
-            ),
-          ),
-        ),
+        child: Padding(padding: const EdgeInsets.all(8), child: box),
       ),
     );
   }

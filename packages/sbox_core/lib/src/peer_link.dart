@@ -220,6 +220,7 @@ class SboxClient implements PeerLink {
     required String code,
     int port = kSboxPort,
   }) async {
+    _reconnectTimer?.cancel(); // evita un reintento pendiente en paralelo
     _host = host;
     _code = code;
     _port = port;
