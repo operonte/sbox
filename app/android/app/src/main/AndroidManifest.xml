@@ -11,6 +11,8 @@
     <!-- Servicio en primer plano: mantener la conexión viva en segundo plano.
          (FOREGROUND_SERVICE, WAKE_LOCK y POST_NOTIFICATIONS los aporta el plugin) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!-- Best-effort: pedir excepción de optimización de batería (pantalla bloqueada) -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
 
     <application
         android:label="sbox"

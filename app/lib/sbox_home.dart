@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:home_widget/home_widget.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:media_store_plus/media_store_plus.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
@@ -207,9 +208,48 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   }
 
   Future<void> _sendClipboard() async {
+    // En el PC (Wayland), si hay una imagen en el portapapeles, enviarla como
+    // archivo. Si no hay imagen (o falla), enviar el texto como siempre.
+    if (isDesktop && await _sendClipboardImage()) return;
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     final text = data?.text;
     if (text != null && text.isNotEmpty) _send(text);
+  }
+
+  /// Lee una imagen del portapapeles vía `wl-paste` (Wayland) y la envía como
+  /// archivo. Devuelve true si encontró y envió una imagen; false si no hay
+  /// imagen o si `wl-clipboard` no está instalado (cae a texto).
+  Future<bool> _sendClipboardImage() async {
+    try {
+      final types = await Process.run('wl-paste', ['--list-types']);
+      if (types.exitCode != 0) return false;
+      String? mime;
+      for (final line in (types.stdout as String).split('\n')) {
+        final type = line.trim();
+        if (type == 'image/png') {
+          mime = type;
+          break;
+        }
+        if (mime == null && type.startsWith('image/')) mime = type;
+      }
+      if (mime == null) return false;
+      final out = await Process.run(
+        'wl-paste',
+        ['--type', mime],
+        stdoutEncoding: null, // bytes crudos
+      );
+      final bytes = out.stdout as List<int>;
+      if (out.exitCode != 0 || bytes.isEmpty) return false;
+      final dir = await getTemporaryDirectory();
+      final ext = mime.split('/').last;
+      final path =
+          '${dir.path}/captura_${DateTime.now().millisecondsSinceEpoch}.$ext';
+      await File(path).writeAsBytes(bytes, flush: true);
+      await _sendFilePath(path);
+      return true;
+    } catch (_) {
+      return false; // wl-paste no disponible → se enviará el texto
+    }
   }
 
   // ----------------------------------------------------------------- archivos
@@ -233,6 +273,51 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     setState(() => _sending = true);
     await _sendFilePath(path);
     if (mounted) setState(() => _sending = false);
+  }
+
+  /// Cámara (Android): tomar una foto o grabar un video y enviarlo al otro
+  /// dispositivo (cae en su carpeta Descargas/sbox).
+  Future<void> _capture() async {
+    if (!_connected) return;
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: cCard,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_camera, color: cAccent),
+              title: const Text('Tomar foto',
+                  style: TextStyle(color: Colors.white)),
+              onTap: () => Navigator.pop(context, 'photo'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam, color: cAccent),
+              title: const Text('Grabar video',
+                  style: TextStyle(color: Colors.white)),
+              onTap: () => Navigator.pop(context, 'video'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null) return;
+    try {
+      final picker = ImagePicker();
+      final file = choice == 'photo'
+          ? await picker.pickImage(source: ImageSource.camera)
+          : await picker.pickVideo(source: ImageSource.camera);
+      if (file == null) return;
+      setState(() => _sending = true);
+      await _sendFilePath(file.path);
+      if (mounted) setState(() => _sending = false);
+    } catch (_) {
+      _toast('No se pudo usar la cámara');
+    }
   }
 
   /// Guarda un archivo recibido (Descargas en PC / almacenamiento de la app en
@@ -260,8 +345,12 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   Future<String> _incomingDir() async {
     if (isDesktop) {
+      // Subcarpeta «sbox» dentro de Descargas (igual que en Android).
       final d = await getDownloadsDirectory();
-      return d?.path ?? '${Platform.environment['HOME']}/Descargas';
+      final base = d?.path ?? '${Platform.environment['HOME']}/Descargas';
+      final dir = Directory('$base/sbox');
+      await dir.create(recursive: true);
+      return dir.path;
     }
     final d = await getApplicationDocumentsDirectory();
     return d.path;
@@ -452,6 +541,11 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   Future<void> _startBgService(String text) async {
     try {
       await FlutterForegroundTask.requestNotificationPermission();
+      // Best-effort: pedir excepción de batería para sobrevivir mejor a la
+      // pantalla bloqueada (depende del fabricante; se pide una sola vez).
+      if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
+        await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+      }
       if (await FlutterForegroundTask.isRunningService) {
         _bgOn = true;
         await _updateBgNotification(text);
@@ -826,6 +920,8 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
                 _pickAndSendFile,
                 color: cAccent,
               ),
+              if (!isDesktop)
+                _iconBtn(Icons.photo_camera, _capture, color: cAccent),
               Expanded(
                 child: TextField(
                   controller: _sendCtrl,
