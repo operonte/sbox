@@ -16,3 +16,7 @@
 *.keystore
 .env
 .env.*
+
+# Carpeta de copias de seguridad locales (keystore, contraseñas): NUNCA subir
+# NADA de aquí, sea cual sea la extensión.
+/NO COPIAR-COMMITEAR-BORRAR/
