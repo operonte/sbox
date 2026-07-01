@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:home_widget/home_widget.dart';
+import 'package:image_cropper/image_cropper.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:media_store_plus/media_store_plus.dart';
 import 'package:open_filex/open_filex.dart';
@@ -302,11 +303,45 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
           ? await picker.pickImage(source: ImageSource.camera)
           : await picker.pickVideo(source: ImageSource.camera);
       if (file == null) return;
+      // Las fotos pasan por el editor (girar/recortar) antes de enviarse; el
+      // video se envía tal cual. En el editor, ✓ envía y ← descarta.
+      var pathToSend = file.path;
+      if (choice == 'photo') {
+        final edited = await _editPhoto(file.path);
+        if (edited == null) return; // canceló en el editor → no se envía nada
+        pathToSend = edited;
+      }
       setState(() => _sending = true);
-      await _sendFilePath(file.path);
+      await _sendFilePath(pathToSend);
       if (mounted) setState(() => _sending = false);
     } catch (_) {
       _toast('No se pudo usar la cámara');
+    }
+  }
+
+  /// Editor de la foto recién tomada: girar y recortar (uCrop nativo). Devuelve
+  /// la ruta de la imagen editada, o `null` si el usuario cancela (equivale a
+  /// «eliminar»: no se envía nada). Si el editor falla, se envía sin editar.
+  Future<String?> _editPhoto(String path) async {
+    try {
+      final cropped = await ImageCropper().cropImage(
+        sourcePath: path,
+        compressQuality: 90,
+        uiSettings: [
+          AndroidUiSettings(
+            toolbarTitle: 'Editar foto',
+            toolbarColor: cBg,
+            toolbarWidgetColor: Colors.white,
+            backgroundColor: cBg,
+            activeControlsWidgetColor: cAccent,
+            lockAspectRatio: false,
+            hideBottomControls: false,
+          ),
+        ],
+      );
+      return cropped?.path;
+    } catch (_) {
+      return path; // editor no disponible → se envía la foto sin editar
     }
   }
 

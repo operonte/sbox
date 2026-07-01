@@ -54,6 +54,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Editor de imagen (girar/recortar) antes de enviar la foto.
+             Lo provee image_cropper (uCrop); requiere un tema AppCompat. -->
+        <activity
+            android:name="com.yalantis.ucrop.UCropActivity"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.AppCompat.Light.NoActionBar"/>
+
         <!-- Servicio en primer plano (mantiene la conexión en 2º plano).
              No cambiar el nombre: lo provee flutter_foreground_task. -->
         <service
