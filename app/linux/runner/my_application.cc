@@ -20,6 +20,19 @@ struct _MyApplication {
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
 
+// Fija una imagen en el portapapeles un instante DESPUÉS de presentar la
+// ventana. En Wayland, tomar posesión del portapapeles exige un "serial" de una
+// interacción/foco reciente; si se hace sin foco, el compositor lo ignora en
+// silencio y la imagen no queda pegable. Al diferirlo ~120 ms, el evento de foco
+// que dispara gtk_window_present ya llegó. Libera el pixbuf al terminar.
+static gboolean set_clipboard_image_deferred(gpointer data) {
+  GdkPixbuf* pixbuf = GDK_PIXBUF(data);
+  GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+  gtk_clipboard_set_image(clipboard, pixbuf);
+  g_object_unref(pixbuf);
+  return G_SOURCE_REMOVE;
+}
+
 // Lee una imagen del portapapeles del sistema con GTK y la devuelve como bytes
 // PNG (o null si no hay imagen). No depende de wl-clipboard ni de nada externo.
 static void clipboard_method_call_cb(FlMethodChannel* channel,
@@ -65,11 +78,16 @@ static void clipboard_method_call_cb(FlMethodChannel* channel,
       if (ok && closed) {
         GdkPixbuf* pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
         if (pixbuf != nullptr) {
-          GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-          // set_image no bloquea (solo fija al propietario). Evitamos
-          // gtk_clipboard_store, que hace round-trip al gestor y podría colgar
-          // el hilo de UI; la caja de sbox está siempre abierta para servirla.
-          gtk_clipboard_set_image(clipboard, pixbuf);
+          // Presentar la caja de sbox un instante para tener foco/serial en
+          // Wayland, y fijar la imagen justo después (diferido) — ver
+          // set_clipboard_image_deferred. Sin foco, el set se ignora en Wayland.
+          MyApplication* self = MY_APPLICATION(user_data);
+          GList* windows = gtk_application_get_windows(GTK_APPLICATION(self));
+          if (windows != nullptr) {
+            gtk_window_present(GTK_WINDOW(windows->data));
+          }
+          g_object_ref(pixbuf);  // mantener vivo hasta el set diferido
+          g_timeout_add(120, set_clipboard_image_deferred, pixbuf);
           done = TRUE;
         }
       }
@@ -94,6 +112,16 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
 // Implements GApplication::activate.
 static void my_application_activate(GApplication* application) {
   MyApplication* self = MY_APPLICATION(application);
+
+  // Instancia única: si ya hay una ventana (segundo lanzamiento de sbox), traerla
+  // al frente en vez de abrir otra caja. Evita dos hosts peleando por el puerto
+  // 47718 (uno escucha con un código y el otro muestra otro → no conecta).
+  GList* existing = gtk_application_get_windows(GTK_APPLICATION(application));
+  if (existing != nullptr) {
+    gtk_window_present(GTK_WINDOW(existing->data));
+    return;
+  }
+
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
 
@@ -207,7 +235,10 @@ MyApplication* my_application_new() {
   // the application to be recognized beyond its binary name.
   g_set_prgname(APPLICATION_ID);
 
+  // Instancia única (antes NON_UNIQUE, que permitía dos cajas a la vez). Con los
+  // flags por defecto, un segundo lanzamiento reenvía "activate" a la instancia
+  // viva (ver my_application_activate) en vez de arrancar otro host.
   return MY_APPLICATION(g_object_new(my_application_get_type(),
                                      "application-id", APPLICATION_ID, "flags",
-                                     G_APPLICATION_NON_UNIQUE, nullptr));
+                                     G_APPLICATION_FLAGS_NONE, nullptr));
 }
