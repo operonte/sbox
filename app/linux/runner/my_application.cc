@@ -12,8 +12,9 @@
 struct _MyApplication {
   GtkApplication parent_instance;
   char** dart_entrypoint_arguments;
-  // Canal nativo para leer imágenes del portapapeles vía GTK (sin herramientas
-  // externas como wl-clipboard). Atiende el método "getImagePng".
+  // Canal nativo para leer/escribir imágenes del portapapeles vía GTK (sin
+  // herramientas externas como wl-clipboard). Métodos "getImagePng" (leer) y
+  // "setImagePng" (dejar una imagen recibida en el portapapeles).
   FlMethodChannel* clipboard_channel;
 };
 
@@ -48,6 +49,34 @@ static void clipboard_method_call_cb(FlMethodChannel* channel,
             fl_method_success_response_new(fl_value_new_null()));
       }
     }
+  } else if (strcmp(fl_method_call_get_name(method_call), "setImagePng") == 0) {
+    // Recibe los bytes de una imagen (cualquier formato que GdkPixbuf entienda)
+    // y la deja en el portapapeles del sistema como imagen. Devuelve true/false.
+    FlValue* args = fl_method_call_get_args(method_call);
+    gboolean done = FALSE;
+    if (args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_UINT8_LIST) {
+      const uint8_t* data = fl_value_get_uint8_list(args);
+      size_t len = fl_value_get_length(args);
+      GdkPixbufLoader* loader = gdk_pixbuf_loader_new();
+      g_autoptr(GError) load_error = nullptr;
+      gboolean ok = gdk_pixbuf_loader_write(loader, data, len, &load_error);
+      // Cerrar siempre el loader (exactamente una vez) para no filtrarlo.
+      gboolean closed = gdk_pixbuf_loader_close(loader, ok ? &load_error : nullptr);
+      if (ok && closed) {
+        GdkPixbuf* pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
+        if (pixbuf != nullptr) {
+          GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+          // set_image no bloquea (solo fija al propietario). Evitamos
+          // gtk_clipboard_store, que hace round-trip al gestor y podría colgar
+          // el hilo de UI; la caja de sbox está siempre abierta para servirla.
+          gtk_clipboard_set_image(clipboard, pixbuf);
+          done = TRUE;
+        }
+      }
+      g_object_unref(loader);
+    }
+    response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_bool(done)));
   } else {
     response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
   }

@@ -150,6 +150,14 @@ class SboxHost implements PeerLink {
     _pendingFile = null;
     if (header == null) return;
     final bytes = raw is Uint8List ? raw : Uint8List.fromList(raw as List<int>);
+    // A prueba de fallos: si los bytes no coinciden con el tamaño anunciado,
+    // el archivo llegó truncado/desincronizado → se descarta (no se guarda
+    // algo corrupto haciéndolo pasar por completo).
+    if (header.size > 0 && bytes.length != header.size) {
+      _log('archivo descartado: ${header.name} (${bytes.length} de '
+          '${header.size} bytes)');
+      return;
+    }
     _log('archivo recibido: ${header.name} (${bytes.length} bytes)');
     _files.add(ReceivedFile(name: header.name ?? 'archivo', bytes: bytes));
   }
@@ -200,9 +208,9 @@ class SboxClient implements PeerLink {
   bool _wasConnected = false;
   bool _rejected = false;
   bool _disposed = false;
+  bool _opening = false; // hay un intento de conexión en curso
   int _retries = 0;
   Timer? _reconnectTimer;
-  static const _maxRetries = 10;
 
   final _messages = StreamController<SboxMessage>.broadcast();
   final _files = StreamController<ReceivedFile>.broadcast();
@@ -232,11 +240,13 @@ class SboxClient implements PeerLink {
 
   /// Abre (o reabre) el socket usando los últimos datos de conexión.
   Future<void> _open() async {
-    if (_disposed || _host == null || _code == null) return;
+    if (_disposed || _host == null || _code == null || _opening) return;
+    _opening = true;
     _state.add(_wasConnected ? PeerState.reconnecting : PeerState.connecting);
     try {
       final ws = await WebSocket.connect('ws://$_host:$_port')
           .timeout(const Duration(seconds: 6));
+      _opening = false;
       ws.pingInterval = const Duration(seconds: 10);
       _ws = ws;
       ws.add(SboxMessage.hello(code: _code!, device: deviceName).encode());
@@ -270,10 +280,23 @@ class SboxClient implements PeerLink {
         cancelOnError: true,
       );
     } on TimeoutException {
+      _opening = false;
       _onConnectFailure('No respondió (¿IP correcta? ¿misma WiFi?)');
     } catch (e) {
+      _opening = false;
       _onConnectFailure('No se pudo conectar');
     }
+  }
+
+  /// Fuerza un reintento inmediato sin esperar el backoff (p. ej. cuando vuelve
+  /// la red o la app al primer plano). Solo actúa si ya habíamos emparejado y no
+  /// hay ya un socket vivo ni un intento en curso.
+  void reconnectNow() {
+    if (_disposed || _rejected || !_wasConnected) return;
+    if (_ws != null || _opening) return;
+    _reconnectTimer?.cancel();
+    _retries = 0;
+    _open();
   }
 
   /// Falló al abrir el socket: si ya habíamos estado conectados, reintenta;
@@ -288,13 +311,11 @@ class SboxClient implements PeerLink {
 
   void _scheduleReconnect() {
     if (_disposed) return;
-    if (_retries >= _maxRetries) {
-      _wasConnected = false;
-      if (!_state.isClosed) _state.add(PeerState.error('Se perdió la conexión'));
-      return;
-    }
+    // Nunca se rinde solo: reintenta indefinidamente con backoff hasta 10 s.
+    // Así una caída de WiFi de varios minutos se recupera sola al volver (solo
+    // el botón rojo de salir corta de verdad). Ver también [reconnectNow].
     _retries++;
-    final secs = _retries < 5 ? _retries : 5; // 1,2,3,4,5,5… segundos
+    final secs = _retries < 10 ? _retries : 10; // 1,2,…,10,10… segundos
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(Duration(seconds: secs), _open);
   }
@@ -305,6 +326,9 @@ class SboxClient implements PeerLink {
     _pendingFile = null;
     if (header == null) return;
     final bytes = raw is Uint8List ? raw : Uint8List.fromList(raw as List<int>);
+    // A prueba de fallos: descarta el archivo si los bytes no coinciden con el
+    // tamaño anunciado (llegó truncado o desincronizado).
+    if (header.size > 0 && bytes.length != header.size) return;
     _files.add(ReceivedFile(name: header.name ?? 'archivo', bytes: bytes));
   }
 

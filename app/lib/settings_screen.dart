@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'platform.dart';
 import 'settings.dart';
 import 'theme.dart';
 
@@ -77,6 +78,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           'Con este nombre te verá el otro dispositivo al emparejar.',
                           style: TextStyle(color: cDim, fontSize: 12, height: 1.4),
                         ),
+                        // Auto-borrado de imágenes: solo afecta al PC (host).
+                        if (isDesktop) ...[
+                          const SizedBox(height: 24),
+                          const _Label('IMÁGENES RECIBIDAS (PC)'),
+                          const SizedBox(height: 10),
+                          _autoDeleteSection(),
+                        ],
                       ],
                     ),
                   ),
@@ -133,6 +141,98 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
         );
       },
+    );
+  }
+
+  Widget _autoDeleteSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        ValueListenableBuilder<bool>(
+          valueListenable: Settings.instance.autoDeleteImages,
+          builder: (context, on, _) => Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'Borrar automáticamente las imágenes que llegan',
+                  style:
+                      TextStyle(color: Colors.white, fontSize: 13, height: 1.35),
+                ),
+              ),
+              Switch(
+                value: on,
+                activeThumbColor: cAccent,
+                onChanged: (v) => Settings.instance.setAutoDeleteImages(v),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 4),
+        // Selector de segundos: atenuado y sin efecto si el borrado está apagado.
+        ValueListenableBuilder<bool>(
+          valueListenable: Settings.instance.autoDeleteImages,
+          builder: (context, on, _) => AnimatedOpacity(
+            opacity: on ? 1 : 0.35,
+            duration: const Duration(milliseconds: 150),
+            child: IgnorePointer(ignoring: !on, child: _secondsSelector()),
+          ),
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'Solo imágenes, solo de la carpeta Descargas/sbox del PC. Pasado ese '
+          'tiempo se borran; los demás archivos no se tocan.',
+          style: TextStyle(color: cDim, fontSize: 12, height: 1.4),
+        ),
+      ],
+    );
+  }
+
+  Widget _secondsSelector() {
+    const options = <String, int>{'15 s': 15, '30 s': 30, '60 s': 60};
+    return ValueListenableBuilder<int>(
+      valueListenable: Settings.instance.autoDeleteSeconds,
+      builder: (context, current, _) {
+        final entries = options.entries.toList();
+        return Row(
+          children: [
+            for (var i = 0; i < entries.length; i++) ...[
+              Expanded(
+                child: _secChip(
+                  entries[i].key,
+                  entries[i].value,
+                  current == entries[i].value,
+                ),
+              ),
+              if (i < entries.length - 1) const SizedBox(width: 8),
+            ],
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _secChip(String label, int value, bool selected) {
+    return GestureDetector(
+      onTap: () => Settings.instance.setAutoDeleteSeconds(value),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: cAccent.withValues(alpha: selected ? 0.18 : 0.05),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: cAccent.withValues(alpha: selected ? 0.6 : 0.18),
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontFamily: fontMono,
+            fontWeight: FontWeight.w700,
+            color: selected ? cAccent : cDim,
+          ),
+        ),
+      ),
     );
   }
 

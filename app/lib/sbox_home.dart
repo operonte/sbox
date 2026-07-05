@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:file_selector/file_selector.dart' as fsel;
@@ -59,19 +60,23 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   final List<DiscoveredHost> _found = [];
   final _ipCtrl = TextEditingController();
   final _codeCtrl = TextEditingController();
-  // Últimos datos de una conexión exitosa, para reconectar al volver al foco.
+  // Últimos datos de una conexión exitosa, para reconectar al volver al foco
+  // (el puerto lo recuerda internamente el propio SboxClient).
   String? _lastHost;
-  int _lastPort = kSboxPort;
   String? _lastCode;
 
   // Envío
   final _sendCtrl = TextEditingController();
+  // Cola de envío de archivos: uno a la vez y en orden (ver [_sendFilePath]).
+  Future<void> _sendQueue = Future<void>.value();
 
   StreamSubscription<PeerState>? _stateSub;
   StreamSubscription<SboxMessage>? _msgSub;
   StreamSubscription<ReceivedFile>? _fileSub;
   StreamSubscription<DiscoveredHost>? _hostSub;
   StreamSubscription<List<SharedMediaFile>>? _shareSub;
+  // Cambios de red (Android): al volver la WiFi, reconectar al instante.
+  StreamSubscription<List<ConnectivityResult>>? _connSub;
 
   // Compartido por «Compartir → sbox» mientras aún no había conexión (se manda
   // al conectar). Archivos por ruta y textos/URLs por separado.
@@ -85,8 +90,23 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   /// y evita que un video enorme deje sin memoria al teléfono.
   static const int _maxFileBytes = 150 * 1024 * 1024; // 150 MB
 
-  /// Canal hacia el runner nativo de Linux para leer imágenes del portapapeles.
+  /// Canal hacia el runner nativo de Linux para leer/escribir imágenes del
+  /// portapapeles.
   static const _clipboardChannel = MethodChannel('sbox/clipboard');
+
+  /// Extensiones consideradas imagen (para el portapapeles y el auto-borrado).
+  static const _imageExts = {
+    '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.heic', '.heif',
+  };
+
+  // Borrados de imágenes programados en el PC (para cancelarlos al cerrar).
+  final List<Timer> _imageDeletions = [];
+
+  bool _isImage(String name) {
+    final dot = name.lastIndexOf('.');
+    if (dot < 0) return false;
+    return _imageExts.contains(name.substring(dot).toLowerCase());
+  }
 
   @override
   void initState() {
@@ -98,7 +118,17 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
       _initForegroundTask();
       _startBrowsing();
       _listenShares();
+      _watchConnectivity();
     }
+  }
+
+  /// Android: cuando vuelve la red (WiFi recuperada), reconectar al instante en
+  /// vez de esperar el backoff. Complementa la reconexión-al-volver-al-foco.
+  void _watchConnectivity() {
+    _connSub = Connectivity().onConnectivityChanged.listen((results) {
+      final hasNet = results.any((r) => r != ConnectivityResult.none);
+      if (hasNet && !_connected) _client?.reconnectNow();
+    });
   }
 
   /// «Compartir → sbox»: lo que el usuario comparte desde otra app (foto, video,
@@ -120,11 +150,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
     if (lifecycle != AppLifecycleState.resumed || isDesktop) return;
-    if (_connected) return;
-    final host = _lastHost;
-    final code = _lastCode;
-    if (host == null || code == null) return;
-    _client?.connect(host, code: code, port: _lastPort);
+    if (_connected || _lastHost == null || _lastCode == null) return;
+    // Ya emparejamos antes: reintento inmediato con reconexión infinita.
+    _client?.reconnectNow();
   }
 
   /// Nombre con el que este equipo se anuncia (configurable; con defecto).
@@ -162,6 +190,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   }
 
   Future<void> _startHost() async {
+    unawaited(_sweepOldImages()); // limpia imágenes viejas de sesiones previas
     _code = (100000 + Random().nextInt(900000)).toString();
     final host = SboxHost(code: _code, deviceName: _myName());
     _host = host;
@@ -204,7 +233,6 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     if (host == null) return;
     final code = _codeCtrl.text.trim();
     _lastHost = host.ip;
-    _lastPort = host.port;
     _lastCode = code;
     _client?.connect(host.ip, code: code, port: host.port);
   }
@@ -359,12 +387,83 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
           _recvSize = f.size;
         });
       }
-      // En Android, copiarlo también a Descargas visible al recibir (en el PC
-      // ya cae directo en ~/Descargas). Así no depende de abrirlo.
-      if (!isDesktop) await _saveToDownloads(path);
+      if (isDesktop) {
+        // Si es imagen: además de quedar en la carpeta, dejarla en el
+        // portapapeles del PC (como ya se hace con el texto) y, si está
+        // activado, programar su borrado de la carpeta sbox.
+        if (_isImage(f.name)) {
+          await _copyImageToClipboard(f.bytes);
+          if (Settings.instance.autoDeleteImages.value) {
+            _scheduleImageDeletion(path);
+          }
+        }
+      } else {
+        // En Android, copiarlo también a Descargas visible al recibir (en el PC
+        // ya cae directo en Descargas/sbox). Así no depende de abrirlo.
+        await _saveToDownloads(path);
+      }
       _updateWidget(lastText: '📎 ${f.name}');
     } catch (e) {
       _toast('No se pudo guardar el archivo');
+    }
+  }
+
+  /// Deja una imagen en el portapapeles del PC vía el canal nativo GTK
+  /// (contraparte de getImagePng). Best-effort: si falla, no rompe nada.
+  Future<void> _copyImageToClipboard(Uint8List bytes) async {
+    try {
+      await _clipboardChannel.invokeMethod<bool>('setImagePng', bytes);
+    } catch (_) {
+      // Sin canal nativo (p. ej. otra plataforma): se ignora en silencio.
+    }
+  }
+
+  /// Programa el borrado de una imagen recibida de la carpeta sbox del PC
+  /// pasados los segundos configurados (portapapeles efímero). Si al borrarla
+  /// seguía siendo la imagen mostrada, limpia la tarjeta de «recibido».
+  void _scheduleImageDeletion(String path) {
+    final secs = Settings.instance.autoDeleteSeconds.value;
+    late final Timer t;
+    t = Timer(Duration(seconds: secs), () async {
+      _imageDeletions.remove(t);
+      try {
+        final file = File(path);
+        if (await file.exists()) await file.delete();
+      } catch (_) {
+        // Ya no está o no se pudo borrar: nada que hacer.
+      }
+      if (mounted && _recvPath == path) {
+        setState(() {
+          _recvName = null;
+          _recvPath = null;
+          _recvSize = 0;
+        });
+      }
+    });
+    _imageDeletions.add(t);
+  }
+
+  /// Al arrancar el host, borra imágenes viejas que quedaran en Descargas/sbox
+  /// (p. ej. si la app se cerró antes de que saltara su temporizador). Hace que
+  /// el borrado efímero sea fiable entre reinicios.
+  Future<void> _sweepOldImages() async {
+    if (!isDesktop || !Settings.instance.autoDeleteImages.value) return;
+    try {
+      final dir = Directory(await _incomingDir());
+      if (!await dir.exists()) return;
+      final maxAge = Duration(seconds: Settings.instance.autoDeleteSeconds.value);
+      final now = DateTime.now();
+      await for (final entity in dir.list()) {
+        if (entity is! File || !_isImage(entity.path)) continue;
+        final stat = await entity.stat();
+        if (now.difference(stat.modified) > maxAge) {
+          try {
+            await entity.delete();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {
+      // La carpeta puede no existir aún o no ser accesible: se ignora.
     }
   }
 
@@ -437,9 +536,18 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   }
 
   // ----------------------------------------------------- compartir / drag&drop
+  /// Envía un archivo por su ruta, encolado: un envío a la vez y en orden. Así
+  /// no se cargan varios archivos grandes en memoria al mismo tiempo (p. ej. al
+  /// compartir o soltar varios juntos) — a prueba de errores frente a OOM.
+  Future<void> _sendFilePath(String path) {
+    final task = _sendQueue.then((_) => _doSendFilePath(path));
+    _sendQueue = task.catchError((_) {}); // un fallo no corta la cola
+    return task;
+  }
+
   /// Lee un archivo del disco por su ruta y lo envía al otro dispositivo.
   /// Comprueba el tamaño ANTES de cargarlo en memoria (a prueba de errores).
-  Future<void> _sendFilePath(String path) async {
+  Future<void> _doSendFilePath(String path) async {
     final name = path.split('/').last;
     try {
       final file = File(path);
@@ -640,6 +748,10 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _fileSub?.cancel();
     _hostSub?.cancel();
     _shareSub?.cancel();
+    _connSub?.cancel();
+    for (final t in _imageDeletions) {
+      t.cancel();
+    }
     _advertiser?.stop();
     _browser?.stop();
     _host?.dispose();
