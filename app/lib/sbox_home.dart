@@ -17,6 +17,7 @@ import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:sbox_core/sbox_core.dart';
+import 'package:share_plus/share_plus.dart' as share_plus;
 import 'package:window_manager/window_manager.dart';
 
 import 'discovery.dart';
@@ -380,12 +381,25 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
       final dir = await _incomingDir();
       final path = await _uniquePath(dir, f.name);
       await File(path).writeAsBytes(f.bytes, flush: true);
+      // En Android la tarjeta solo muestra el último recibido: borrar la copia
+      // interna del anterior para no acumular archivos en la app. (En el PC la
+      // copia vive en Descargas/sbox, que es del usuario: no se toca aquí.)
+      final previous = _recvPath;
+      if (!isDesktop && previous != null && previous != path) {
+        try {
+          await File(previous).delete();
+        } catch (_) {}
+      }
       if (mounted) {
         setState(() {
           _recvName = f.name;
           _recvPath = path;
           _recvSize = f.size;
         });
+      } else {
+        _recvName = f.name;
+        _recvPath = path;
+        _recvSize = f.size;
       }
       if (isDesktop) {
         // Si es imagen: además de quedar en la carpeta, dejarla en el
@@ -500,25 +514,57 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     // recibir. Aquí solo se abre.
     if (isDesktop) {
       await Process.run('xdg-open', [path]);
-    } else {
-      await OpenFilex.open(path);
+      return;
+    }
+    final result = await OpenFilex.open(path);
+    if (result.type != ResultType.done) {
+      _toast('No hay una app para abrir este archivo');
+    }
+  }
+
+  /// Comparte el último archivo recibido con la hoja de compartir del sistema
+  /// (otras apps, guardar, etc.) sin salir de sbox. Solo Android.
+  Future<void> _shareReceived() async {
+    final path = _recvPath;
+    if (path == null) return;
+    try {
+      await share_plus.Share.shareXFiles([share_plus.XFile(path)]);
+    } catch (_) {
+      _toast('No se pudo compartir el archivo');
     }
   }
 
   /// Copia un archivo a la carpeta Descargas visible (Descargas/sbox) vía
   /// MediaStore. A prueba de fallos: si no se puede, el archivo igual se abre.
+  ///
+  /// Ojo: `MediaStore.saveFile` BORRA el archivo de origen tras copiarlo. Por
+  /// eso le pasamos una copia temporal (mismo nombre, carpeta de caché) y así
+  /// conservamos la copia interna, que es la que usan «Ver» y «Compartir».
   Future<void> _saveToDownloads(String path) async {
+    String? tmp;
     try {
       MediaStore.appFolder = 'sbox';
       await MediaStore.ensureInitialized();
+      final cache = await getTemporaryDirectory();
+      tmp = '${cache.path}/${path.split('/').last}';
+      await File(path).copy(tmp);
       final info = await MediaStore().saveFile(
-        tempFilePath: path,
+        tempFilePath: tmp,
         dirType: DirType.download,
         dirName: DirName.download,
       );
       if (info != null) _toast('Guardado en Descargas/sbox');
     } catch (_) {
       // Sin acceso a Descargas: se abre desde la copia interna igualmente.
+    } finally {
+      // Si MediaStore no llegó a borrar el temporal (p. ej. falló antes),
+      // limpiarlo para no dejar basura en la caché.
+      if (tmp != null) {
+        try {
+          final leftover = File(tmp);
+          if (await leftover.exists()) await leftover.delete();
+        } catch (_) {}
+      }
     }
   }
 
@@ -1145,7 +1191,8 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     );
   }
 
-  // Tarjeta del último archivo recibido, con botón para abrirlo.
+  // Tarjeta del último archivo recibido, con botones para compartirlo (Android)
+  // y abrirlo.
   Widget _receivedFileCard() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -1179,7 +1226,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
               ],
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 4),
+          if (!isDesktop)
+            _iconBtn(Icons.share, _shareReceived, color: cOnline),
           _iconBtn(Icons.open_in_new, _openReceived, color: cOnline),
         ],
       ),
