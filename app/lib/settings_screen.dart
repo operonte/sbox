@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'about_screen.dart';
 import 'autostart.dart';
+import 'help_screen.dart';
 import 'platform.dart';
 import 'privacy_screen.dart';
 import 'settings.dart';
@@ -114,6 +115,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           const _Label('INICIO AUTOMÁTICO'),
                           const SizedBox(height: 10),
                           _autostartSection(),
+                        ],
+                        // Guía de uso + descargas de PC: solo tiene sentido en
+                        // Android (en el PC ya ves el código en pantalla).
+                        if (!isDesktop) ...[
+                          const SizedBox(height: 24),
+                          const _Label('AYUDA'),
+                          const SizedBox(height: 10),
+                          _navRow(context, Icons.help_outline, 'Cómo usar sbox',
+                              () => const HelpScreen()),
                         ],
                         const SizedBox(height: 24),
                         const _Label('ACERCA DE SBOX'),
