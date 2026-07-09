@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 
+import 'about_screen.dart';
 import 'autostart.dart';
 import 'platform.dart';
+import 'privacy_screen.dart';
 import 'settings.dart';
 import 'theme.dart';
 
@@ -113,6 +115,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           const SizedBox(height: 10),
                           _autostartSection(),
                         ],
+                        const SizedBox(height: 24),
+                        const _Label('ACERCA DE SBOX'),
+                        const SizedBox(height: 10),
+                        _navRow(context, Icons.info_outline, 'Acerca de',
+                            () => const AboutScreen()),
+                        const SizedBox(height: 8),
+                        _navRow(context, Icons.privacy_tip_outlined,
+                            'Política de privacidad', () => const PrivacyScreen()),
                       ],
                     ),
                   ),
@@ -169,6 +179,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
         );
       },
+    );
+  }
+
+  Widget _navRow(
+    BuildContext context,
+    IconData icon,
+    String label,
+    Widget Function() screen,
+  ) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: () => Navigator.of(context)
+          .push(MaterialPageRoute(builder: (_) => screen())),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.25),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: cBorder),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, color: cDim, size: 18),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 13)),
+            ),
+            const Icon(Icons.chevron_right, color: cDim, size: 18),
+          ],
+        ),
+      ),
     );
   }
 

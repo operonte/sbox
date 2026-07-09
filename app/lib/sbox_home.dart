@@ -597,8 +597,19 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     return d.path;
   }
 
+  /// Se queda solo con el nombre del archivo, descartando cualquier ruta
+  /// («../../.config/autostart/x.desktop» → «x.desktop»). El nombre viaja tal
+  /// cual lo mande el otro lado por el protocolo (`fileHeader.name`) — sin
+  /// esto, un nombre con «..» escapa de la carpeta de descargas al escribir
+  /// el archivo.
+  String _safeFileName(String name) {
+    final base = name.split(RegExp(r'[/\\]')).last.trim();
+    return (base.isEmpty || base == '.' || base == '..') ? 'archivo' : base;
+  }
+
   /// Evita pisar archivos: «foto.png» → «foto (1).png» si ya existe.
-  Future<String> _uniquePath(String dir, String name) async {
+  Future<String> _uniquePath(String dir, String rawName) async {
+    final name = _safeFileName(rawName);
     if (!await File('$dir/$name').exists()) return '$dir/$name';
     final dot = name.lastIndexOf('.');
     final base = dot > 0 ? name.substring(0, dot) : name;
