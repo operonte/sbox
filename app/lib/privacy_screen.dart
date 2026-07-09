@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'about_screen.dart' show kLinkedInUrl, kRepoUrl;
+import 'about_screen.dart' show kLinkedInUrl;
 import 'theme.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -63,12 +63,9 @@ class PrivacyScreen extends StatelessWidget {
                         const _Label('SIN CUENTAS, SIN RASTREO'),
                         const _P(
                           'No hay registro, no hay analítica, no hay '
-                          'publicidad ni permisos de terceros. El código de '
-                          'sbox es público — puedes revisarlo tú mismo.',
+                          'publicidad ni permisos de terceros.',
                         ),
                         const SizedBox(height: 8),
-                        _linkRow(Icons.code, 'Ver el código fuente', kRepoUrl),
-                        const SizedBox(height: 24),
                         const _Label('CONTACTO'),
                         const _P(
                           'Para preguntas sobre esta política o sobre sbox, '

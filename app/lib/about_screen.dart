@@ -4,7 +4,6 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'theme.dart';
 
-const kRepoUrl = 'https://github.com/operonte/sbox';
 const kLinkedInUrl = 'https://www.linkedin.com/in/cristian-bravo-droguett';
 
 Future<void> _open(String url) async {
@@ -77,8 +76,6 @@ class AboutScreen extends StatelessWidget {
                           style: TextStyle(color: Colors.white, fontSize: 13, height: 1.5),
                         ),
                         const SizedBox(height: 24),
-                        _linkRow(Icons.code, 'Código fuente (GitHub)', kRepoUrl),
-                        const SizedBox(height: 8),
                         _linkRow(Icons.person, 'Cristian Bravo · LinkedIn', kLinkedInUrl),
                       ],
                     ),
