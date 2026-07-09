@@ -190,6 +190,10 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
           final stale = TrustStore.instance.tokenFor(_found.first.label);
           if (stale != null) TrustStore.instance.forget(stale);
         }
+        // Sin esto la pantalla se quedaba trabada en "Conectando…" (el botón
+        // se deshabilita en ese estado): hay que volver a "idle" para que el
+        // usuario pueda escribir el código a mano.
+        if (mounted) setState(() => _state = PeerState.idle);
         return;
       }
       if (s.status == PeerStatus.connected) {
