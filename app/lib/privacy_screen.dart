@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
-
-import 'about_screen.dart' show kLinkedInUrl;
-import 'theme.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-/// Pantalla "Política de privacidad": simple y honesta porque sbox no tiene
-/// servidor ni recolecta nada — no hay mucho que declarar.
+import 'about_screen.dart' show kLinkedInUrl, kPrivacyUrl;
+import 'theme.dart';
+
+/// Pantalla "Política de privacidad": resumen corto + link a la versión
+/// alojada en la web (la fuente única — evita mantener el texto duplicado en
+/// dos lugares, y es la que se declara en la ficha de la tienda).
 class PrivacyScreen extends StatelessWidget {
   const PrivacyScreen({super.key});
 
@@ -37,35 +38,10 @@ class PrivacyScreen extends StatelessWidget {
                           'analiza ni envía tus datos a ningún lado — ni '
                           'siquiera al desarrollador.',
                         ),
-                        const _Label('¿QUÉ HACE SBOX CON TUS DATOS?'),
-                        const _P(
-                          'El texto, las imágenes y los archivos que compartes '
-                          'viajan directo entre tu PC y tu teléfono, por tu '
-                          'propia red WiFi. Nunca pasan por un servidor '
-                          'externo ni por internet: si ambos dispositivos no '
-                          'están en la misma red, sbox no funciona.',
-                        ),
-                        const _P(
-                          'Nada de esto se guarda con fines de análisis: es '
-                          'un portapapeles, no un historial. Los archivos '
-                          'recibidos quedan en tu carpeta de Descargas, como '
-                          'cualquier archivo que bajarías a mano.',
-                        ),
-                        const _Label('¿QUÉ SE GUARDA EN EL DISPOSITIVO?'),
-                        const _P(
-                          'Solo ajustes locales (nombre del dispositivo, '
-                          'tamaño de texto, preferencias) y los dispositivos '
-                          '"de confianza" que emparejaste, para no pedirte el '
-                          'código cada vez. Todo queda en tu propio '
-                          'dispositivo — puedes borrar un dispositivo de '
-                          'confianza cuando quieras desde Configuración.',
-                        ),
-                        const _Label('SIN CUENTAS, SIN RASTREO'),
-                        const _P(
-                          'No hay registro, no hay analítica, no hay '
-                          'publicidad ni permisos de terceros.',
-                        ),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 20),
+                        _linkRow(Icons.lock_outline, 'Ver la política completa',
+                            kPrivacyUrl),
+                        const SizedBox(height: 24),
                         const _Label('CONTACTO'),
                         const _P(
                           'Para preguntas sobre esta política o sobre sbox, '
@@ -143,7 +119,7 @@ class _Label extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.only(top: 20, bottom: 10),
+      padding: const EdgeInsets.only(bottom: 10),
       child: Text(
         text,
         style: const TextStyle(

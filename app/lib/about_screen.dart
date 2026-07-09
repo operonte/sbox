@@ -5,6 +5,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'theme.dart';
 
 const kLinkedInUrl = 'https://www.linkedin.com/in/cristian-bravo-droguett';
+const kPrivacyUrl = 'https://cristianbravo-dev.web.app/es/privacy/sbox';
 
 Future<void> _open(String url) async {
   await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
