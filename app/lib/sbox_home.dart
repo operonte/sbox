@@ -55,6 +55,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   int _port = kSboxPort;
   List<String> _ips = const [];
   SboxAdvertiser? _advertiser;
+  // Notifica al SboxHost cuando cambia la lista de dispositivos de confianza
+  // (p. ej. al "olvidar" uno en Configuración); se quita al recrear el host.
+  VoidCallback? _trustListener;
 
   // Cliente (Android)
   SboxBrowser? _browser;
@@ -65,6 +68,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   // (el puerto lo recuerda internamente el propio SboxClient).
   String? _lastHost;
   String? _lastCode;
+  // Hay un intento de auto-conexión con un token guardado en curso: si lo
+  // rechazan, no se muestra "código incorrecto" (el usuario no pidió esto).
+  bool _autoConnecting = false;
 
   // Envío
   final _sendCtrl = TextEditingController();
@@ -174,10 +180,33 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _msgSub?.cancel();
     _fileSub?.cancel();
     _stateSub = link.state.listen((s) {
+      if (_autoConnecting &&
+          (s.status == PeerStatus.rejected || s.status == PeerStatus.error)) {
+        // Intento silencioso con un token guardado: si falla, no asustamos
+        // con un error que el usuario no pidió; solo volvemos a la pantalla
+        // normal de emparejado.
+        _autoConnecting = false;
+        if (s.status == PeerStatus.rejected && _found.isNotEmpty) {
+          final stale = TrustStore.instance.tokenFor(_found.first.label);
+          if (stale != null) TrustStore.instance.forget(stale);
+        }
+        return;
+      }
+      if (s.status == PeerStatus.connected) {
+        _autoConnecting = false;
+        if (s.token != null) {
+          TrustStore.instance.remember(s.token!, s.peerName ?? 'PC');
+        }
+      }
       if (mounted) setState(() => _state = s);
       _updateWidget();
       _syncBgService(s); // mantener vivo el servicio en 2º plano según el estado
       _flushPendingShares(); // si quedaron compartidos en cola, mandarlos ya
+      if (s.status == PeerStatus.connected) {
+        _startClipboardWatch();
+      } else {
+        _stopClipboardWatch();
+      }
     });
     _msgSub = link.messages.listen((m) async {
       if (m.type == SboxMsgType.text && m.content != null) {
@@ -193,7 +222,15 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   Future<void> _startHost() async {
     unawaited(_sweepOldImages()); // limpia imágenes viejas de sesiones previas
     _code = (100000 + Random().nextInt(900000)).toString();
-    final host = SboxHost(code: _code, deviceName: _myName());
+    final host = SboxHost(
+      code: _code,
+      deviceName: _myName(),
+      trustedTokens: TrustStore.instance.tokens.value.keys.toSet(),
+      onTrust: (token, label) => TrustStore.instance.remember(token, label),
+    );
+    _trustListener = () =>
+        host.updateTrustedTokens(TrustStore.instance.tokens.value.keys.toSet());
+    TrustStore.instance.tokens.addListener(_trustListener!);
     _host = host;
     _listen(host);
     _port = await host.start();
@@ -218,6 +255,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _hostSub = _browser!.hosts.listen((h) {
       if (_found.any((e) => e.key == h.key)) return;
       if (mounted) setState(() => _found.add(h));
+      _maybeAutoConnect(h);
     });
     try {
       await _browser!.start();
@@ -235,7 +273,20 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     final code = _codeCtrl.text.trim();
     _lastHost = host.ip;
     _lastCode = code;
+    _autoConnecting = false; // conexión pedida a mano: sí mostrar errores
     _client?.connect(host.ip, code: code, port: host.port);
+  }
+
+  /// Si ya conocemos [h] (nos dio un token en un emparejado anterior), nos
+  /// conectamos solos sin mostrarle el código al usuario.
+  void _maybeAutoConnect(DiscoveredHost h) {
+    if (_connected || _client == null) return;
+    final token = TrustStore.instance.tokenFor(h.label);
+    if (token == null) return;
+    _autoConnecting = true;
+    _lastHost = h.ip;
+    _lastCode = '';
+    _client!.connect(h.ip, token: token, port: h.port);
   }
 
   void _send(String text) {
@@ -255,12 +306,19 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   /// Lee una imagen del portapapeles usando el canal nativo GTK del runner (sin
   /// herramientas externas) y la envía como archivo. Devuelve true si había una
-  /// imagen y se envió; false si no (entonces se envía el texto).
-  Future<bool> _sendClipboardImage() async {
+  /// imagen (se haya enviado o no); false si no hay imagen (entonces se envía
+  /// el texto). Con [dedupe] no reenvía la misma imagen dos veces seguidas
+  /// (para el vigilante automático; el botón manual siempre reenvía).
+  Future<bool> _sendClipboardImage({bool dedupe = false}) async {
     try {
       final bytes =
           await _clipboardChannel.invokeMethod<Uint8List>('getImagePng');
       if (bytes == null || bytes.isEmpty) return false;
+      if (dedupe) {
+        final hash = _quickHash(bytes);
+        if (hash == _lastAutoImageHash) return true; // ya se mandó esta misma
+        _lastAutoImageHash = hash;
+      }
       final dir = await getTemporaryDirectory();
       final path =
           '${dir.path}/captura_${DateTime.now().millisecondsSinceEpoch}.png';
@@ -270,6 +328,47 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     } catch (_) {
       return false; // sin imagen o canal no disponible → se enviará el texto
     }
+  }
+
+  /// Suma de verificación barata (no criptográfica) para notar si la imagen
+  /// del portapapeles cambió, sin comparar los bytes completos en cada tick.
+  int _quickHash(Uint8List bytes) {
+    var h = bytes.length;
+    for (var i = 0; i < bytes.length; i += 97) {
+      h = 0x1fffffff & (h * 31 + bytes[i]);
+    }
+    return h;
+  }
+
+  // ------------------------------------------------------ auto-portapapeles
+  /// Revisa el portapapeles cada [_clipboardPollInterval] y manda solo lo que
+  /// cambió (evita reenviar lo mismo, y evita el eco de lo que acabamos de
+  /// recibir del otro lado — ver comparación con [_shared]).
+  static const _clipboardPollInterval = Duration(seconds: 2);
+  Timer? _clipboardWatch;
+  int? _lastAutoImageHash;
+
+  void _startClipboardWatch() {
+    _clipboardWatch ??=
+        Timer.periodic(_clipboardPollInterval, (_) => _autoClipboardTick());
+  }
+
+  void _stopClipboardWatch() {
+    _clipboardWatch?.cancel();
+    _clipboardWatch = null;
+    _lastAutoImageHash = null;
+  }
+
+  Future<void> _autoClipboardTick() async {
+    if (!Settings.instance.autoClipboard.value || !_connected || _sending) {
+      return;
+    }
+    if (isDesktop && await _sendClipboardImage(dedupe: true)) return;
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text;
+    // Distinto de lo último compartido (mandado o recibido): es una copia
+    // nueva del usuario, no un eco de lo que sbox acaba de traer.
+    if (text != null && text.isNotEmpty && text != _shared) _send(text);
   }
 
   // ----------------------------------------------------------------- archivos
@@ -766,6 +865,10 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     await _browser?.stop();
     await _host?.dispose();
     await _client?.dispose();
+    if (_trustListener != null) {
+      TrustStore.instance.tokens.removeListener(_trustListener!);
+      _trustListener = null;
+    }
     _host = null;
     _client = null;
     _advertiser = null;
@@ -795,6 +898,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _hostSub?.cancel();
     _shareSub?.cancel();
     _connSub?.cancel();
+    _clipboardWatch?.cancel();
     for (final t in _imageDeletions) {
       t.cancel();
     }
@@ -802,6 +906,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _browser?.stop();
     _host?.dispose();
     _client?.dispose();
+    if (_trustListener != null) {
+      TrustStore.instance.tokens.removeListener(_trustListener!);
+    }
     _ipCtrl.dispose();
     _codeCtrl.dispose();
     _sendCtrl.dispose();

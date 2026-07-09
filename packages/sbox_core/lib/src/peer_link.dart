@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'messages.dart';
@@ -11,10 +12,14 @@ enum PeerStatus { idle, listening, connecting, connected, rejected, error }
 
 /// Estado del enlace entre las dos cajas.
 class PeerState {
-  const PeerState(this.status, {this.peerName, this.message});
+  const PeerState(this.status, {this.peerName, this.message, this.token});
   final PeerStatus status;
   final String? peerName;
   final String? message;
+
+  /// Presente solo en [PeerStatus.connected]: token de confianza a guardar
+  /// para que la próxima vez este dispositivo se reconecte sin pedir código.
+  final String? token;
 
   static const idle = PeerState(PeerStatus.idle);
   static const listening = PeerState(PeerStatus.listening);
@@ -23,8 +28,8 @@ class PeerState {
       PeerState(PeerStatus.connecting, message: 'Reconectando…');
   static const rejected =
       PeerState(PeerStatus.rejected, message: 'Código incorrecto');
-  factory PeerState.connected(String name) =>
-      PeerState(PeerStatus.connected, peerName: name);
+  factory PeerState.connected(String name, {String? token}) =>
+      PeerState(PeerStatus.connected, peerName: name, token: token);
   factory PeerState.error(String m) => PeerState(PeerStatus.error, message: m);
 }
 
@@ -61,10 +66,23 @@ Future<List<String>> localIPv4() async {
 /// El host (la PC): levanta un servidor WebSocket en la LAN y atiende a un
 /// único cliente. Valida el código de emparejamiento (decorativo).
 class SboxHost implements PeerLink {
-  SboxHost({required this.code, required this.deviceName});
+  SboxHost({
+    required this.code,
+    required this.deviceName,
+    Set<String>? trustedTokens,
+    this.onTrust,
+  }) : _trustedTokens = {...?trustedTokens};
 
   final String code;
   final String deviceName;
+
+  /// Se llama cuando un dispositivo queda (o sigue) emparejado, con el token
+  /// a recordar y el nombre actual del dispositivo — para que la app lo
+  /// persista y no vuelva a pedirle el código la próxima vez.
+  final void Function(String token, String deviceName)? onTrust;
+
+  final Set<String> _trustedTokens;
+  String? _peerToken; // token con el que se autenticó el peer conectado ahora
 
   HttpServer? _server;
   WebSocket? _peer;
@@ -72,6 +90,24 @@ class SboxHost implements PeerLink {
   final _messages = StreamController<SboxMessage>.broadcast();
   final _files = StreamController<ReceivedFile>.broadcast();
   final _state = StreamController<PeerState>.broadcast();
+
+  /// Reemplaza el conjunto de tokens de confianza (p. ej. tras "olvidar" un
+  /// dispositivo en Configuración). Si el peer conectado ahora mismo usaba un
+  /// token que ya no es de confianza, se le desconecta.
+  void updateTrustedTokens(Set<String> tokens) {
+    _trustedTokens
+      ..clear()
+      ..addAll(tokens);
+    if (_peerToken != null && !_trustedTokens.contains(_peerToken)) {
+      _peer?.close();
+    }
+  }
+
+  String _newToken() {
+    final rnd = Random.secure();
+    final bytes = List<int>.generate(16, (_) => rnd.nextInt(256));
+    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  }
 
   @override
   Stream<SboxMessage> get messages => _messages.stream;
@@ -114,15 +150,31 @@ class SboxHost implements PeerLink {
         final msg = SboxMessage.tryDecode(raw);
         if (msg == null) return;
         if (msg.type == SboxMsgType.hello) {
-          if (msg.code != code) {
+          final incoming = msg.device ?? 'dispositivo';
+          String token;
+          if (msg.token != null && _trustedTokens.contains(msg.token)) {
+            // Dispositivo ya conocido: entra sin pedirle el código.
+            token = msg.token!;
+            _log('EMPAREJADO (conocido) con $incoming');
+          } else if (msg.code == code) {
+            // Primera vez (o token olvidado): valida el código y le da uno
+            // nuevo para que no vuelva a pedírselo.
+            token = _newToken();
+            _trustedTokens.add(token);
+            _log('EMPAREJADO (nuevo) con $incoming');
+          } else {
             _log('código equivocado: "${msg.code}" (esperaba "$code")');
             ws.add(SboxMessage.welcome(ok: false).encode());
             ws.close();
             return;
           }
-          _log('EMPAREJADO con ${msg.device}');
-          ws.add(SboxMessage.welcome(ok: true, device: deviceName).encode());
-          _state.add(PeerState.connected(msg.device ?? 'dispositivo'));
+          _peerToken = token;
+          onTrust?.call(token, incoming);
+          ws.add(
+            SboxMessage.welcome(ok: true, device: deviceName, token: token)
+                .encode(),
+          );
+          _state.add(PeerState.connected(incoming));
         } else if (msg.type == SboxMsgType.text) {
           _log('texto recibido (${msg.content?.length ?? 0} chars)');
           _messages.add(msg);
@@ -169,6 +221,7 @@ class SboxHost implements PeerLink {
 
   void _onPeerGone() {
     _peer = null;
+    _peerToken = null;
     _pendingFile = null;
     if (!_state.isClosed) _state.add(PeerState.listening);
   }
@@ -204,6 +257,7 @@ class SboxClient implements PeerLink {
   // Reconexión: recuerda a quién estaba conectado y reintenta si se cae.
   String? _host;
   String? _code;
+  String? _token;
   int _port = kSboxPort;
   bool _wasConnected = false;
   bool _rejected = false;
@@ -223,14 +277,18 @@ class SboxClient implements PeerLink {
   @override
   Stream<PeerState> get state => _state.stream;
 
+  /// [token]: si ya emparejamos antes con este host, el token que nos dio la
+  /// última vez — así entra directo, sin pedir [code].
   Future<void> connect(
     String host, {
-    required String code,
+    String code = '',
+    String? token,
     int port = kSboxPort,
   }) async {
     _reconnectTimer?.cancel(); // evita un reintento pendiente en paralelo
     _host = host;
     _code = code;
+    _token = token;
     _port = port;
     _wasConnected = false;
     _rejected = false;
@@ -249,7 +307,10 @@ class SboxClient implements PeerLink {
       _opening = false;
       ws.pingInterval = const Duration(seconds: 10);
       _ws = ws;
-      ws.add(SboxMessage.hello(code: _code!, device: deviceName).encode());
+      ws.add(
+        SboxMessage.hello(code: _code ?? '', device: deviceName, token: _token)
+            .encode(),
+      );
       ws.listen(
         (raw) {
           // Trama binaria: bytes del archivo cuya cabecera ya llegó.
@@ -268,7 +329,8 @@ class SboxClient implements PeerLink {
             }
             _wasConnected = true;
             _retries = 0;
-            _state.add(PeerState.connected(msg.device ?? 'PC'));
+            _token = msg.token ?? _token;
+            _state.add(PeerState.connected(msg.device ?? 'PC', token: _token));
           } else if (msg.type == SboxMsgType.fileHeader) {
             _pendingFile = msg;
           } else if (msg.type != SboxMsgType.ping) {

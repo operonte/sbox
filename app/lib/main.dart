@@ -12,6 +12,7 @@ import 'window_state.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Settings.instance.load();
+  await TrustStore.instance.load();
 
   if (isDesktop) {
     await windowManager.ensureInitialized();

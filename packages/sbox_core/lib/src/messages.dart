@@ -25,13 +25,24 @@ class SboxMessage {
   factory SboxMessage.text(String content) =>
       SboxMessage(SboxMsgType.text, {'content': content});
 
-  /// El cliente saluda al host con el código de emparejamiento.
-  factory SboxMessage.hello({required String code, required String device}) =>
-      SboxMessage(SboxMsgType.hello, {'code': code, 'device': device});
+  /// El cliente saluda al host con el código de emparejamiento, o con el
+  /// [token] que le dieron la vez anterior si ya es un dispositivo conocido
+  /// (en ese caso [code] puede ir vacío).
+  factory SboxMessage.hello({
+    required String code,
+    required String device,
+    String? token,
+  }) =>
+      SboxMessage(
+        SboxMsgType.hello,
+        {'code': code, 'device': device, 'token': ?token},
+      );
 
-  /// El host acepta (ok=true) o rechaza (ok=false) al cliente.
-  factory SboxMessage.welcome({required bool ok, String? device}) =>
-      SboxMessage(SboxMsgType.welcome, {'ok': ok, 'device': ?device});
+  /// El host acepta (ok=true) o rechaza (ok=false) al cliente. Si acepta,
+  /// [token] es el que el cliente debe guardar y reenviar la próxima vez
+  /// para no tener que volver a pedir el código.
+  factory SboxMessage.welcome({required bool ok, String? device, String? token}) =>
+      SboxMessage(SboxMsgType.welcome, {'ok': ok, 'device': ?device, 'token': ?token});
 
   /// Cabecera que anuncia un archivo; la siguiente trama será sus bytes.
   factory SboxMessage.fileHeader({required String name, required int size}) =>
@@ -40,6 +51,7 @@ class SboxMessage {
   String? get content => data['content'] as String?;
   String? get code => data['code'] as String?;
   String? get device => data['device'] as String?;
+  String? get token => data['token'] as String?;
   String? get name => data['name'] as String?;
   int get size => (data['size'] as num?)?.toInt() ?? 0;
   bool get ok => data['ok'] == true;
