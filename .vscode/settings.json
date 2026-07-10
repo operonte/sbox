@@ -1,3 +1,4 @@
 {
-    "cmake.sourceDirectory": "/home/cristian/X/Github/sbox/app/linux"
+    "cmake.sourceDirectory": "/home/cristian/X/Github/sbox/app/linux",
+    "java.compile.nullAnalysis.mode": "automatic"
 }

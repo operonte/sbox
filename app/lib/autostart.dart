@@ -31,12 +31,14 @@ class LinuxAutostart {
     final exe = Platform.resolvedExecutable;
     final iconPath = '${File(exe).parent.path}/sbox_icon.png';
     final icon = await File(iconPath).exists() ? iconPath : 'sbox';
+    // --tray: al iniciar con el sistema, se queda en la bandeja en vez de
+    // mostrar la caja encima de todo (ver tray.dart / main.dart).
     await File(file).writeAsString('''
 [Desktop Entry]
 Type=Application
 Name=sbox
 Comment=Portapapeles universal entre PC y Android por la misma WiFi
-Exec=$exe
+Exec=$exe --tray
 Icon=$icon
 Terminal=false
 X-GNOME-Autostart-enabled=true

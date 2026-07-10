@@ -5,11 +5,12 @@ import 'platform.dart';
 import 'sbox_home.dart';
 import 'settings.dart';
 import 'theme.dart';
+import 'tray.dart';
 import 'window_state.dart';
 
 /// sbox — portapapeles universal PC ↔ Android por la misma WiFi, sin servidor.
 
-Future<void> main() async {
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
   await Settings.instance.load();
   await TrustStore.instance.load();
@@ -23,6 +24,10 @@ Future<void> main() async {
       windowButtonVisibility: false,
       alwaysOnTop: true,
     );
+    // --tray: arranque automático con el sistema (ver autostart.dart) — se
+    // queda solo en la bandeja, sin mostrar la caja encima de todo al
+    // iniciar sesión.
+    final startHidden = args.contains('--tray');
     await windowManager.waitUntilReadyToShow(options, () async {
       await windowManager.setAsFrameless();
       await windowManager.setResizable(true);
@@ -32,10 +37,13 @@ Future<void> main() async {
       await windowManager.setAlwaysOnTop(true);
       // Posición/tamaño: última guardada, o esquina superior izquierda.
       await WindowState.restoreOrDefault();
-      await windowManager.show();
-      await windowManager.focus();
+      if (!startHidden) {
+        await windowManager.show();
+        await windowManager.focus();
+      }
     });
     windowManager.addListener(WindowStateSaver());
+    await SboxTray().init();
   }
 
   runApp(const SboxApp());
