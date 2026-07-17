@@ -48,12 +48,11 @@ cd app && flutter run -d android
 cd app && flutter build apk --debug
 ```
 
-## Hoja de ruta
-
 - [x] Esqueleto del monorepo (app + sbox_core)
 - [x] Caja flotante de escritorio (frameless, translúcida, always-on-top)
-- [ ] Descubrimiento por LAN (mDNS) + canal WebSocket P2P
-- [ ] Emparejamiento con código de 6 dígitos
-- [ ] Transferencia de texto y archivos
-- [ ] Drag & drop y lectura de portapapeles en escritorio
-- [ ] Widget interactivo 2×2 en Android
+- [x] Descubrimiento por LAN (mDNS) + canal WebSocket P2P
+- [x] Emparejamiento con código de 6 dígitos
+- [x] Transferencia de texto y archivos
+- [x] Drag & drop y lectura de portapapeles en escritorio (incluyendo soporte nativo GTK para imágenes)
+- [x] Widget interactivo y servicio en primer plano (Android)
+
