@@ -29,36 +29,20 @@ sbox/
     └── sbox_core/        # lógica compartida: descubrimiento LAN + protocolo (próximamente)
 ```
 
-## Requisitos del Sistema (Linux / Ubuntu / Pop!_OS)
+## Preparación (Instalación y configuración de librerías)
 
-Para compilar, ejecutar y usar `sbox` en una instalación limpia de Linux, se deben cumplir los siguientes requisitos:
+Para preparar una instalación limpia de Linux (Pop!_OS, Ubuntu, Debian, etc.), copia y ejecuta este bloque completo en tu terminal para instalar dependencias y configurar los puertos necesarios:
 
-### 1. Dependencias de Compilación y Ejecución
-Instala las herramientas esenciales de desarrollo, las bibliotecas de GTK3 y los gestores de portapapeles (`wl-clipboard` para Wayland, `xclip` para X11):
 ```bash
+# 1. Actualizar repositorios e instalar dependencias de desarrollo, librerías GTK3 y gestores de portapapeles
 sudo apt update
-sudo apt install -y \
-  clang \
-  cmake \
-  ninja-build \
-  pkg-config \
-  libgtk-3-dev \
-  liblzma-dev \
-  libgcrypt20-dev \
-  wl-clipboard \
-  xclip
-```
+sudo apt install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libgcrypt20-dev wl-clipboard xclip
 
-### 2. Descubrimiento por Red Local (mDNS)
-Sbox utiliza `avahi-daemon` para el descubrimiento automático de dispositivos por mDNS/DNS-SD en la red local. Asegúrate de tenerlo instalado, activo y habilitado:
-```bash
+# 2. Instalar y activar el servicio de descubrimiento por red local (mDNS/DNS-SD)
 sudo apt install -y avahi-daemon
 sudo systemctl enable --now avahi-daemon
-```
 
-### 3. Configuración del Cortafuegos (UFW)
-Si tu cortafuegos está activo, bloqueará las conexiones entrantes desde el celular. Debes abrir el puerto de comunicación de Sbox (TCP `47718`) y el puerto de descubrimiento mDNS (UDP `5353`):
-```bash
+# 3. Configurar el cortafuegos (abrir puerto TCP 47718 de comunicación y puerto UDP 5353 de descubrimiento)
 sudo ufw allow 47718/tcp
 sudo ufw allow 5353/udp
 sudo ufw reload
@@ -68,21 +52,17 @@ sudo ufw reload
 
 ## Instalación y Uso en Linux (Paso a Paso)
 
-### Paso 1: Clonar el repositorio
+Una vez preparado el sistema, copia y ejecuta el siguiente bloque para compilar e instalar la aplicación en el menú de tu distribución:
+
 ```bash
+# 1. Clonar el repositorio y acceder a la carpeta
 git clone https://github.com/operonte/sbox.git
 cd sbox
-```
 
-### Paso 2: Compilar e instalar la aplicación de escritorio
-Ejecuta el script de instalación para compilar el proyecto en modo `release` e instalar el binario junto con un lanzador (`.desktop`) para que aparezca en el menú de tus aplicaciones:
-```bash
+# 2. Compilar en modo release e instalar en el sistema (creará el lanzador .desktop en tu menú)
 ./scripts/install-linux.sh
-```
 
-### Paso 3: Lanzar la aplicación
-Busca **sbox** en el menú de aplicaciones de tu distribución o ejecuta directamente:
-```bash
+# 3. Iniciar la aplicación (también puedes buscar "sbox" en tu menú de aplicaciones de escritorio)
 ~/.local/opt/sbox/sbox
 ```
 
