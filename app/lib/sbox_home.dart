@@ -65,6 +65,14 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   IOSink? _incomingSink;
   bool _incomingDiscard = false; // no había espacio suficiente: se descarta
 
+  // Estado visible de "recibiendo «nombre»… NN%" — mismo espíritu que
+  // _sendingProgress, del otro lado de la transferencia.
+  bool _receiving = false;
+  String? _receivingName;
+  double _receivingProgress = 0;
+  int _receivingTotal = 0;
+  int _receivingSoFar = 0;
+
   // Host (PC)
   String _code = '';
   int _port = kSboxPort;
@@ -247,6 +255,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         if (mounted) setState(() => _shared = m.content);
         // Portapapeles compartido: copiar automáticamente lo recibido.
         await Clipboard.setData(ClipboardData(text: m.content!));
+        // El portapapeles del sistema ya tiene este valor porque lo pusimos
+        // nosotros — que el próximo tick no lo trate como una copia nueva.
+        _lastClipboardText = m.content;
         _updateWidget();
       }
     });
@@ -345,7 +356,10 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     if (isDesktop && await _sendClipboardImage()) return;
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     final text = data?.text;
-    if (text != null && text.isNotEmpty) _send(text);
+    if (text != null && text.isNotEmpty) {
+      _lastClipboardText = text; // ya procesamos este valor del portapapeles
+      _send(text);
+    }
   }
 
   /// Lee una imagen del portapapeles usando el canal nativo GTK del runner (sin
@@ -386,11 +400,19 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   // ------------------------------------------------------ auto-portapapeles
   /// Revisa el portapapeles cada [_clipboardPollInterval] y manda solo lo que
-  /// cambió (evita reenviar lo mismo, y evita el eco de lo que acabamos de
-  /// recibir del otro lado — ver comparación con [_shared]).
+  /// cambió de verdad en el portapapeles del sistema.
   static const _clipboardPollInterval = Duration(seconds: 2);
   Timer? _clipboardWatch;
   int? _lastAutoImageHash;
+
+  /// Último valor del portapapeles del SISTEMA que ya procesamos (mandado, o
+  /// puesto ahí por nosotros al recibir) — distinto de [_shared], que puede
+  /// cambiar sin tocar el portapapeles (p. ej. al escribir texto a mano en el
+  /// cuadro de envío). Comparar el tick contra [_shared] en vez de esto hacía
+  /// que, después de escribir a mano, el portapapeles viejo (sin cambiar)
+  /// pareciera "nuevo" frente al `_shared` recién actualizado, y lo pisaba
+  /// enseguida con lo de antes.
+  String? _lastClipboardText;
 
   void _startClipboardWatch() {
     _clipboardWatch ??=
@@ -410,9 +432,12 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     if (isDesktop && await _sendClipboardImage(dedupe: true)) return;
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     final text = data?.text;
-    // Distinto de lo último compartido (mandado o recibido): es una copia
-    // nueva del usuario, no un eco de lo que sbox acaba de traer.
-    if (text != null && text.isNotEmpty && text != _shared) _send(text);
+    if (text == null || text.isEmpty || text == _lastClipboardText) return;
+    // El portapapeles del sistema cambió de verdad: es una copia nueva.
+    _lastClipboardText = text;
+    // Si además coincide con lo último sincronizado, es un eco (lo que
+    // nosotros mismos pusimos ahí) — no reenviar.
+    if (text != _shared) _send(text);
   }
 
   // ----------------------------------------------------------------- archivos
@@ -526,6 +551,15 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _incomingDiscard = false;
     _incomingSink = null;
     _incomingTempPath = null;
+    _receivingSoFar = 0;
+    _receivingTotal = size;
+    if (mounted) {
+      setState(() {
+        _receiving = true;
+        _receivingName = name;
+        _receivingProgress = 0;
+      });
+    }
     if (size > _spaceCheckThreshold && !await _hasEnoughSpace(size)) {
       // Sin espacio: se sigue "recibiendo" (no se puede frenar al emisor a
       // mitad de camino sin sumar un mensaje de cancelación al protocolo),
@@ -546,6 +580,14 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   void _onFileData(Uint8List bytes) {
     _incomingSink?.add(bytes);
+    _receivingSoFar += bytes.length;
+    if (_receivingTotal <= 0 || !mounted) return;
+    // No hacer setState en cada pedazo (un archivo de 2 GB son miles): solo
+    // cuando cambia el % entero que se muestra.
+    final pct = (_receivingSoFar / _receivingTotal * 100).clamp(0, 100).round();
+    if (pct != (_receivingProgress * 100).round()) {
+      setState(() => _receivingProgress = _receivingSoFar / _receivingTotal);
+    }
   }
 
   /// Terminó de llegar el archivo (u ocurrió un corte a mitad de camino).
@@ -561,6 +603,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _incomingTempPath = null;
     _incomingName = null;
     _incomingDiscard = false;
+    if (mounted) setState(() => _receiving = false);
     try {
       await sink?.close();
     } catch (_) {}
@@ -1062,6 +1105,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _incomingTempPath = null;
     _incomingName = null;
     _incomingDiscard = false;
+    _receiving = false;
     await _hostSub?.cancel();
     await _advertiser?.stop();
     await _browser?.stop();
@@ -1379,6 +1423,10 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
               ),
             ],
           ),
+          if (_receiving) ...[
+            const SizedBox(height: 12),
+            _receivingStatus(),
+          ],
           if (_recvName != null) ...[
             const SizedBox(height: 12),
             _receivedFileCard(),
@@ -1523,6 +1571,31 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         Flexible(
           child: Text(
             'Enviando «${_sendingName ?? ''}»… ${(_sendingProgress * 100).round()}%',
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: cDim, fontSize: 12),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// % real de progreso mientras se recibe un archivo — mismo espíritu que
+  /// [_sendingStatus], del otro lado de la transferencia. Antes solo el que
+  /// enviaba veía un %; quien recibía no tenía ninguna señal de que el
+  /// archivo seguía en camino (podía parecer que algo falló cuando en
+  /// realidad solo faltaba terminar de llegar).
+  Widget _receivingStatus() {
+    return Row(
+      children: [
+        const SizedBox(
+          width: 14,
+          height: 14,
+          child: CircularProgressIndicator(strokeWidth: 2, color: cDim),
+        ),
+        const SizedBox(width: 10),
+        Flexible(
+          child: Text(
+            'Recibiendo «${_receivingName ?? ''}»… ${(_receivingProgress * 100).round()}%',
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(color: cDim, fontSize: 12),
           ),
