@@ -18,22 +18,26 @@ class LinuxAutostart {
     return File(file).exists();
   }
 
-  static Future<void> setEnabled(bool enabled) async {
+  /// Devuelve true si el cambio se aplicó de verdad (archivo creado/borrado
+  /// en disco). Si falla (sin permisos, disco lleno), el llamador puede
+  /// revertir el interruptor en vez de dejarlo mintiendo sobre el estado real.
+  static Future<bool> setEnabled(bool enabled) async {
     final file = _file;
-    if (file == null) return;
-    if (!enabled) {
-      final f = File(file);
-      if (await f.exists()) await f.delete();
-      return;
-    }
-    final dir = Directory(_dir!);
-    if (!await dir.exists()) await dir.create(recursive: true);
-    final exe = Platform.resolvedExecutable;
-    final iconPath = '${File(exe).parent.path}/sbox_icon.png';
-    final icon = await File(iconPath).exists() ? iconPath : 'sbox';
-    // --tray: al iniciar con el sistema, se queda en la bandeja en vez de
-    // mostrar la caja encima de todo (ver tray.dart / main.dart).
-    await File(file).writeAsString('''
+    if (file == null) return false;
+    try {
+      if (!enabled) {
+        final f = File(file);
+        if (await f.exists()) await f.delete();
+        return true;
+      }
+      final dir = Directory(_dir!);
+      if (!await dir.exists()) await dir.create(recursive: true);
+      final exe = Platform.resolvedExecutable;
+      final iconPath = '${File(exe).parent.path}/sbox_icon.png';
+      final icon = await File(iconPath).exists() ? iconPath : 'sbox';
+      // --tray: al iniciar con el sistema, se queda en la bandeja en vez de
+      // mostrar la caja encima de todo (ver tray.dart / main.dart).
+      await File(file).writeAsString('''
 [Desktop Entry]
 Type=Application
 Name=sbox
@@ -43,5 +47,9 @@ Icon=$icon
 Terminal=false
 X-GNOME-Autostart-enabled=true
 ''');
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 }

@@ -20,7 +20,11 @@ class SboxTray with TrayListener {
     } catch (_) {
       // Sin ícono no hay bandeja visible, pero sbox sigue funcionando igual.
     }
-    await trayManager.setToolTip('sbox');
+    try {
+      // No implementado en Linux por el plugin (solo setIcon/setContextMenu):
+      // sin esto, la excepción sin capturar tumbaba el arranque entero.
+      await trayManager.setToolTip('sbox');
+    } catch (_) {}
     await trayManager.setContextMenu(
       Menu(items: [
         MenuItem(

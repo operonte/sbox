@@ -329,7 +329,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
               activeThumbColor: cAccent,
               onChanged: (v) async {
                 setState(() => _autostartOn = v); // responde al toque ya
-                await LinuxAutostart.setEnabled(v);
+                final ok = await LinuxAutostart.setEnabled(v);
+                if (!ok && mounted) {
+                  // El archivo no se pudo crear/borrar (sin permisos, disco
+                  // lleno): revertir el switch para no mentir sobre el estado
+                  // real — sin esto quedaba en ON sin autostart de verdad.
+                  setState(() => _autostartOn = !v);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('No se pudo cambiar el inicio automático'),
+                      duration: Duration(seconds: 2),
+                    ),
+                  );
+                }
               },
             ),
           ],
@@ -353,7 +365,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             children: [
               const Expanded(
                 child: Text(
-                  'Borrar automáticamente las imágenes que llegan',
+                  'Borrar automáticamente lo que llega',
                   style:
                       TextStyle(color: Colors.white, fontSize: 13, height: 1.35),
                 ),
@@ -378,8 +390,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         const SizedBox(height: 8),
         const Text(
-          'Solo imágenes, solo de la carpeta Descargas/sbox del PC. Pasado ese '
-          'tiempo se borran; los demás archivos no se tocan.',
+          'Cualquier archivo recibido, solo de la carpeta Descargas/sbox del '
+          'PC. Pasado ese tiempo se borra.',
           style: TextStyle(color: cDim, fontSize: 12, height: 1.4),
         ),
       ],

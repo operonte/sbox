@@ -14,11 +14,11 @@ class Settings {
   /// Nombre con el que este dispositivo se anuncia al emparejar.
   final ValueNotifier<String> deviceName = ValueNotifier<String>('');
 
-  /// Borrar automáticamente las imágenes recibidas de la carpeta sbox del PC
-  /// pasados unos segundos (portapapeles efímero). Solo aplica en escritorio.
+  /// Borrar automáticamente cualquier archivo recibido de la carpeta sbox del
+  /// PC pasados unos segundos (portapapeles efímero). Solo aplica en escritorio.
   final ValueNotifier<bool> autoDeleteImages = ValueNotifier<bool>(true);
 
-  /// Segundos antes de borrar una imagen recibida (si [autoDeleteImages]).
+  /// Segundos antes de borrar un archivo recibido (si [autoDeleteImages]).
   final ValueNotifier<int> autoDeleteSeconds = ValueNotifier<int>(30);
 
   /// Enviar el portapapeles automáticamente al detectar un cambio, sin

@@ -31,4 +31,19 @@ void main() {
     );
     expect(welcomeConToken!.token, 'xyz');
   });
+
+  test('fileHeader y fileProgress hacen round-trip por JSON', () {
+    final header = SboxMessage.tryDecode(
+      SboxMessage.fileHeader(name: 'foto.png', size: 2048).encode(),
+    );
+    expect(header!.type, SboxMsgType.fileHeader);
+    expect(header.name, 'foto.png');
+    expect(header.size, 2048);
+
+    final progress = SboxMessage.tryDecode(
+      SboxMessage.fileProgress(received: 1024).encode(),
+    );
+    expect(progress!.type, SboxMsgType.fileProgress);
+    expect(progress.received, 1024);
+  });
 }

@@ -1,18 +1,11 @@
 import 'dart:convert';
-import 'dart:typed_data';
 
 /// Tipos de mensaje del protocolo sbox.
-/// `fileHeader` es una trama de texto (nombre + tamaño) que precede a una
-/// trama binaria con los bytes del archivo.
-enum SboxMsgType { hello, welcome, text, fileHeader, ping }
-
-/// Un archivo recibido completo (cabecera + bytes ya emparejados).
-class ReceivedFile {
-  ReceivedFile({required this.name, required this.bytes});
-  final String name;
-  final Uint8List bytes;
-  int get size => bytes.length;
-}
+/// `fileHeader` es una trama de texto (nombre + tamaño) que precede a varias
+/// tramas binarias con los bytes del archivo, en pedazos. `fileProgress` es
+/// el acuse que manda quien RECIBE de vuelta a quien envía, con cuánto lleva
+/// acumulado — así el emisor puede mostrar un % real, no adivinado.
+enum SboxMsgType { hello, welcome, text, fileHeader, fileProgress, ping }
 
 /// Mensaje que viaja por el canal entre las dos cajas. Se serializa como JSON.
 class SboxMessage {
@@ -21,9 +14,14 @@ class SboxMessage {
   final SboxMsgType type;
   final Map<String, dynamic> data;
 
-  /// Texto compartido (lo que se "copia" entre dispositivos).
-  factory SboxMessage.text(String content) =>
-      SboxMessage(SboxMsgType.text, {'content': content});
+  /// Texto compartido (lo que se "copia" entre dispositivos). Lleva el
+  /// momento en que este dispositivo detectó la copia (`copiedAt`, epoch ms)
+  /// para que el otro lado sepa si esto es más nuevo que lo que ya tiene —
+  /// así se resuelve quién manda cuando PC y celular copian casi a la vez.
+  factory SboxMessage.text(String content) => SboxMessage(SboxMsgType.text, {
+        'content': content,
+        'copiedAt': DateTime.now().millisecondsSinceEpoch,
+      });
 
   /// El cliente saluda al host con el código de emparejamiento, o con el
   /// [token] que le dieron la vez anterior si ya es un dispositivo conocido
@@ -44,9 +42,14 @@ class SboxMessage {
   factory SboxMessage.welcome({required bool ok, String? device, String? token}) =>
       SboxMessage(SboxMsgType.welcome, {'ok': ok, 'device': ?device, 'token': ?token});
 
-  /// Cabecera que anuncia un archivo; la siguiente trama será sus bytes.
+  /// Cabecera que anuncia un archivo; las siguientes tramas binarias serán
+  /// sus bytes, en pedazos, hasta completar [size].
   factory SboxMessage.fileHeader({required String name, required int size}) =>
       SboxMessage(SboxMsgType.fileHeader, {'name': name, 'size': size});
+
+  /// Acuse de recepción parcial de un archivo en curso.
+  factory SboxMessage.fileProgress({required int received}) =>
+      SboxMessage(SboxMsgType.fileProgress, {'received': received});
 
   String? get content => data['content'] as String?;
   String? get code => data['code'] as String?;
@@ -54,6 +57,8 @@ class SboxMessage {
   String? get token => data['token'] as String?;
   String? get name => data['name'] as String?;
   int get size => (data['size'] as num?)?.toInt() ?? 0;
+  int get copiedAt => (data['copiedAt'] as num?)?.toInt() ?? 0;
+  int get received => (data['received'] as num?)?.toInt() ?? 0;
   bool get ok => data['ok'] == true;
 
   String encode() => jsonEncode({'type': type.name, ...data});

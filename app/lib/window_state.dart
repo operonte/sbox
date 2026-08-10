@@ -1,4 +1,4 @@
-import 'dart:ui' show Rect, Size;
+import 'dart:ui' show PlatformDispatcher, Rect, Size;
 
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
@@ -18,7 +18,27 @@ class WindowState {
     final h = prefs.getDouble(_kh) ?? _defaultSize.height;
     final x = prefs.getDouble(_kx) ?? _margin;
     final y = prefs.getDouble(_ky) ?? _margin;
-    await windowManager.setBounds(Rect.fromLTWH(x, y, w, h));
+    final saved = Rect.fromLTWH(x, y, w, h);
+    // Los bounds guardados pueden apuntar fuera de la pantalla actual (p. ej.
+    // se guardaron con un monitor externo que ya no está conectado). Sin este
+    // chequeo, la caja —sin bordes ni entrada en la barra de tareas— abriría
+    // fuera del área visible y no habría forma de recuperarla salvo borrando
+    // la configuración a mano.
+    final bounds = _withinScreen(saved)
+        ? saved
+        : Rect.fromLTWH(_margin, _margin, _defaultSize.width, _defaultSize.height);
+    await windowManager.setBounds(bounds);
+  }
+
+  /// true si [bounds] cae, al menos parcialmente, dentro del área visible de
+  /// la pantalla principal (alcanza con que una esquina sea alcanzable).
+  static bool _withinScreen(Rect bounds) {
+    final display = PlatformDispatcher.instance.views.first.display;
+    final ratio = display.devicePixelRatio;
+    final screen = Rect.fromLTWH(
+      0, 0, display.size.width / ratio, display.size.height / ratio,
+    );
+    return screen.overlaps(bounds);
   }
 
   /// Guarda la posición/tamaño actuales (se llama al mover/redimensionar).

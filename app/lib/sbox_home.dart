@@ -43,12 +43,27 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   PeerState _state = PeerState.idle;
   String? _shared; // último texto compartido (lo que viaja entre cajas)
+  // Momento (epoch ms) de la copia actualmente en [_shared]: al recibir texto
+  // más viejo que esto (cruzado con una copia más reciente del otro lado) se
+  // ignora, para que siempre gane la copia más nueva sin importar el orden
+  // de llegada por la red.
+  int _sharedAt = 0;
 
   // Último archivo recibido (efímero: solo el último).
   String? _recvName;
   String? _recvPath;
   int _recvSize = 0;
   bool _sending = false;
+  // Estado del envío en curso, para mostrar "Enviando «nombre»… NN%" — %
+  // real, confirmado por acuses del otro lado (ver [_doSendFilePath]).
+  String? _sendingName;
+  double _sendingProgress = 0;
+
+  // Archivo actualmente en recepción (temporal, hasta [FileFinished]).
+  String? _incomingTempPath;
+  String? _incomingName;
+  IOSink? _incomingSink;
+  bool _incomingDiscard = false; // no había espacio suficiente: se descarta
 
   // Host (PC)
   String _code = '';
@@ -79,7 +94,8 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   StreamSubscription<PeerState>? _stateSub;
   StreamSubscription<SboxMessage>? _msgSub;
-  StreamSubscription<ReceivedFile>? _fileSub;
+  StreamSubscription<FileEvent>? _fileSub;
+  StreamSubscription<double>? _sendProgressSub;
   StreamSubscription<DiscoveredHost>? _hostSub;
   StreamSubscription<List<SharedMediaFile>>? _shareSub;
   // Cambios de red (Android): al volver la WiFi, reconectar al instante.
@@ -93,21 +109,30 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   // Servicio en primer plano (Android): mantiene la conexión viva en 2º plano.
   bool _bgOn = false;
 
-  /// Tope de tamaño por archivo. Es un portapapeles: para fotos/clips va sobrado
-  /// y evita que un video enorme deje sin memoria al teléfono.
-  static const int _maxFileBytes = 150 * 1024 * 1024; // 150 MB
+  /// Tope de tamaño por archivo. El envío/recepción es en streaming (memoria
+  /// acotada), así que el límite real es solo para no llenar el disco.
+  static const int _maxFileBytes = 2 * 1024 * 1024 * 1024; // 2 GB
+
+  /// A partir de qué tamaño vale la pena chequear espacio libre en disco
+  /// antes de aceptar un archivo (por debajo, no se pierde tiempo en eso).
+  static const int _spaceCheckThreshold = 50 * 1024 * 1024; // 50 MB
+  /// Margen extra exigido además del tamaño del archivo (no justo al límite).
+  static const int _spaceMargin = 10 * 1024 * 1024; // 10 MB
 
   /// Canal hacia el runner nativo de Linux para leer/escribir imágenes del
   /// portapapeles.
   static const _clipboardChannel = MethodChannel('sbox/clipboard');
+
+  /// Canal nativo (Linux y Android) para consultar espacio libre en disco.
+  static const _diskSpaceChannel = MethodChannel('sbox/diskspace');
 
   /// Extensiones consideradas imagen (para el portapapeles y el auto-borrado).
   static const _imageExts = {
     '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.heic', '.heif',
   };
 
-  // Borrados de imágenes programados en el PC (para cancelarlos al cerrar).
-  final List<Timer> _imageDeletions = [];
+  // Borrados de archivos recibidos programados en el PC (para cancelarlos al cerrar).
+  final List<Timer> _scheduledDeletions = [];
 
   bool _isImage(String name) {
     final dot = name.lastIndexOf('.');
@@ -214,17 +239,31 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     });
     _msgSub = link.messages.listen((m) async {
       if (m.type == SboxMsgType.text && m.content != null) {
+        // Llegó cruzado con una copia más reciente que ya tenemos (el otro
+        // lado copió antes que nosotros pero el mensaje tardó más en
+        // llegar): se descarta para que siempre gane la copia más nueva.
+        if (m.copiedAt < _sharedAt) return;
+        _sharedAt = m.copiedAt;
         if (mounted) setState(() => _shared = m.content);
         // Portapapeles compartido: copiar automáticamente lo recibido.
         await Clipboard.setData(ClipboardData(text: m.content!));
         _updateWidget();
       }
     });
-    _fileSub = link.files.listen(_onFileReceived);
+    _fileSub = link.fileEvents.listen((event) {
+      switch (event) {
+        case FileStarted(:final name, :final size):
+          _onFileStarted(name, size);
+        case FileData(:final bytes):
+          _onFileData(bytes);
+        case FileFinished(:final ok):
+          _onFileFinished(ok);
+      }
+    });
   }
 
   Future<void> _startHost() async {
-    unawaited(_sweepOldImages()); // limpia imágenes viejas de sesiones previas
+    unawaited(_sweepOldFiles()); // limpia archivos viejos de sesiones previas
     _code = (100000 + Random().nextInt(900000)).toString();
     final host = SboxHost(
       code: _code,
@@ -296,6 +335,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   void _send(String text) {
     if (text.isEmpty) return;
     _link?.send(SboxMessage.text(text));
+    _sharedAt = DateTime.now().millisecondsSinceEpoch;
     if (mounted) setState(() => _shared = text);
   }
 
@@ -386,6 +426,10 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         path = (await fsel.openFile())?.path;
       } else {
         final result = await FilePicker.platform.pickFiles();
+        if (result != null && result.files.length > 1) {
+          _toast('Elegí solo un archivo');
+          return;
+        }
         path = result?.files.single.path;
       }
     } catch (e) {
@@ -393,15 +437,13 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
       return;
     }
     if (path == null) return;
-    setState(() => _sending = true);
-    await _sendFilePath(path);
-    if (mounted) setState(() => _sending = false);
+    await _sendFilePath(path); // _doSendFilePath prende/apaga _sending solo
   }
 
   /// Cámara (Android): tomar una foto o grabar un video y enviarlo al otro
   /// dispositivo (cae en su carpeta Descargas/sbox).
   Future<void> _capture() async {
-    if (!_connected) return;
+    if (!_connected || _sending) return;
     final choice = await showModalBottomSheet<String>(
       context: context,
       backgroundColor: cCard,
@@ -443,9 +485,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         if (edited == null) return; // canceló en el editor → no se envía nada
         pathToSend = edited;
       }
-      setState(() => _sending = true);
-      await _sendFilePath(pathToSend);
-      if (mounted) setState(() => _sending = false);
+      await _sendFilePath(pathToSend); // _doSendFilePath prende/apaga _sending solo
     } catch (_) {
       _toast('No se pudo usar la cámara');
     }
@@ -477,13 +517,84 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     }
   }
 
-  /// Guarda un archivo recibido (Descargas en PC / almacenamiento de la app en
-  /// Android) y lo deja listo para abrir.
-  Future<void> _onFileReceived(ReceivedFile f) async {
+  /// Llegó la cabecera de un archivo nuevo: decide dónde escribirlo (o si
+  /// hay que descartarlo por falta de espacio) ANTES de que lleguen bytes.
+  /// Escribe a un temporal `.part` en la misma carpeta destino — así el
+  /// `rename()` final es en el mismo filesystem (rápido y atómico).
+  Future<void> _onFileStarted(String name, int size) async {
+    _incomingName = name;
+    _incomingDiscard = false;
+    _incomingSink = null;
+    _incomingTempPath = null;
+    if (size > _spaceCheckThreshold && !await _hasEnoughSpace(size)) {
+      // Sin espacio: se sigue "recibiendo" (no se puede frenar al emisor a
+      // mitad de camino sin sumar un mensaje de cancelación al protocolo),
+      // pero los bytes que lleguen se tiran en vez de escribirse a disco.
+      _incomingDiscard = true;
+      return;
+    }
     try {
       final dir = await _incomingDir();
-      final path = await _uniquePath(dir, f.name);
-      await File(path).writeAsBytes(f.bytes, flush: true);
+      final tempPath =
+          '$dir/.sbox-incoming-${DateTime.now().millisecondsSinceEpoch}.part';
+      _incomingSink = File(tempPath).openWrite();
+      _incomingTempPath = tempPath;
+    } catch (_) {
+      _incomingDiscard = true; // no se pudo abrir el archivo: descartar
+    }
+  }
+
+  void _onFileData(Uint8List bytes) {
+    _incomingSink?.add(bytes);
+  }
+
+  /// Terminó de llegar el archivo (u ocurrió un corte a mitad de camino).
+  /// Cierra el temporal y, si todo salió bien, lo deja listo para abrir con
+  /// el mismo camino que ya existía (portapapeles, borrado automático,
+  /// Descargas en Android, widget).
+  Future<void> _onFileFinished(bool ok) async {
+    final sink = _incomingSink;
+    final tempPath = _incomingTempPath;
+    final name = _incomingName;
+    final discard = _incomingDiscard;
+    _incomingSink = null;
+    _incomingTempPath = null;
+    _incomingName = null;
+    _incomingDiscard = false;
+    try {
+      await sink?.close();
+    } catch (_) {}
+    if (name == null) return;
+    if (!ok) {
+      if (tempPath != null) {
+        try {
+          await File(tempPath).delete();
+        } catch (_) {}
+      }
+      if (!discard) _toast('«$name» llegó incompleto, se descartó');
+      return;
+    }
+    if (discard) {
+      if (tempPath != null) {
+        try {
+          await File(tempPath).delete();
+        } catch (_) {}
+      }
+      _toast('«$name» no se guardó: no hay espacio suficiente en el disco');
+      return;
+    }
+    if (tempPath == null) return;
+    try {
+      final dir = await _incomingDir();
+      final path = await _uniquePath(dir, name);
+      try {
+        await File(tempPath).rename(path);
+      } catch (_) {
+        // rename() puede fallar si cruza de filesystem: copiar y borrar.
+        await File(tempPath).copy(path);
+        await File(tempPath).delete();
+      }
+      final size = await File(path).length();
       // En Android la tarjeta solo muestra el último recibido: borrar la copia
       // interna del anterior para no acumular archivos en la app. (En el PC la
       // copia vive en Descargas/sbox, que es del usuario: no se toca aquí.)
@@ -495,33 +606,49 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
       }
       if (mounted) {
         setState(() {
-          _recvName = f.name;
+          _recvName = name;
           _recvPath = path;
-          _recvSize = f.size;
+          _recvSize = size;
         });
       } else {
-        _recvName = f.name;
+        _recvName = name;
         _recvPath = path;
-        _recvSize = f.size;
+        _recvSize = size;
       }
       if (isDesktop) {
-        // Si es imagen: además de quedar en la carpeta, dejarla en el
-        // portapapeles del PC (como ya se hace con el texto) y, si está
-        // activado, programar su borrado de la carpeta sbox.
-        if (_isImage(f.name)) {
-          await _copyImageToClipboard(f.bytes);
-          if (Settings.instance.autoDeleteImages.value) {
-            _scheduleImageDeletion(path);
-          }
+        // Si es imagen, además de quedar en la carpeta, dejarla en el
+        // portapapeles del PC (como ya se hace con el texto). Las imágenes
+        // son chicas — no hay problema en releerlas del disco acá.
+        if (_isImage(name)) {
+          await _copyImageToClipboard(await File(path).readAsBytes());
+        }
+        // Borrado automático de la carpeta sbox: aplica a cualquier archivo
+        // recibido, no solo imágenes (es un portapapeles efímero).
+        if (Settings.instance.autoDeleteImages.value) {
+          _scheduleFileDeletion(path);
         }
       } else {
         // En Android, copiarlo también a Descargas visible al recibir (en el PC
         // ya cae directo en Descargas/sbox). Así no depende de abrirlo.
         await _saveToDownloads(path);
       }
-      _updateWidget(lastText: '📎 ${f.name}');
+      _updateWidget(lastText: '📎 $name');
     } catch (e) {
       _toast('No se pudo guardar el archivo');
+    }
+  }
+
+  /// Consulta el espacio libre en la carpeta destino vía el canal nativo. Si
+  /// el canal falla o no está disponible, deja pasar (un chequeo que no se
+  /// pudo hacer no debe bloquear una recepción legítima).
+  Future<bool> _hasEnoughSpace(int size) async {
+    try {
+      final dir = await _incomingDir();
+      final free = await _diskSpaceChannel.invokeMethod<int>('getFreeBytes', dir);
+      if (free == null) return true;
+      return free >= size + _spaceMargin;
+    } catch (_) {
+      return true;
     }
   }
 
@@ -535,14 +662,15 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     }
   }
 
-  /// Programa el borrado de una imagen recibida de la carpeta sbox del PC
-  /// pasados los segundos configurados (portapapeles efímero). Si al borrarla
-  /// seguía siendo la imagen mostrada, limpia la tarjeta de «recibido».
-  void _scheduleImageDeletion(String path) {
+  /// Programa el borrado de un archivo recibido de la carpeta sbox del PC
+  /// pasados los segundos configurados (portapapeles efímero: aplica a
+  /// cualquier archivo, no solo imágenes). Si al borrarlo seguía siendo el
+  /// archivo mostrado, limpia la tarjeta de «recibido».
+  void _scheduleFileDeletion(String path) {
     final secs = Settings.instance.autoDeleteSeconds.value;
     late final Timer t;
     t = Timer(Duration(seconds: secs), () async {
-      _imageDeletions.remove(t);
+      _scheduledDeletions.remove(t);
       try {
         final file = File(path);
         if (await file.exists()) await file.delete();
@@ -557,21 +685,33 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         });
       }
     });
-    _imageDeletions.add(t);
+    _scheduledDeletions.add(t);
   }
 
-  /// Al arrancar el host, borra imágenes viejas que quedaran en Descargas/sbox
+  /// Al arrancar el host, borra archivos viejos que quedaran en Descargas/sbox
   /// (p. ej. si la app se cerró antes de que saltara su temporizador). Hace que
-  /// el borrado efímero sea fiable entre reinicios.
-  Future<void> _sweepOldImages() async {
-    if (!isDesktop || !Settings.instance.autoDeleteImages.value) return;
+  /// el borrado efímero sea fiable entre reinicios. También borra cualquier
+  /// `.part` huérfano (recepción cortada por un cierre/crash a mitad de
+  /// camino) — eso es siempre basura, sin importar el ajuste de auto-borrado
+  /// (al arrancar el host no puede haber ninguna recepción en curso todavía).
+  Future<void> _sweepOldFiles() async {
+    if (!isDesktop) return;
     try {
       final dir = Directory(await _incomingDir());
       if (!await dir.exists()) return;
+      final autoDelete = Settings.instance.autoDeleteImages.value;
       final maxAge = Duration(seconds: Settings.instance.autoDeleteSeconds.value);
       final now = DateTime.now();
       await for (final entity in dir.list()) {
-        if (entity is! File || !_isImage(entity.path)) continue;
+        if (entity is! File) continue;
+        final isPart = entity.path.endsWith('.part');
+        if (!isPart && !autoDelete) continue;
+        if (isPart) {
+          try {
+            await entity.delete();
+          } catch (_) {}
+          continue;
+        }
         final stat = await entity.stat();
         if (now.difference(stat.modified) > maxAge) {
           try {
@@ -627,7 +767,13 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     // En el PC está en ~/Descargas; en Android ya se copió a Descargas/sbox al
     // recibir. Aquí solo se abre.
     if (isDesktop) {
-      await Process.run('xdg-open', [path]);
+      final result = await Process.run('xdg-open', [path]);
+      // xdg-open falla en silencio si no hay una app asociada a este tipo de
+      // archivo; sin este chequeo el botón "abrir" no hacía nada y parecía
+      // que sbox estaba roto.
+      if (result.exitCode != 0) {
+        _toast('No hay una app para abrir este archivo');
+      }
       return;
     }
     final result = await OpenFilex.open(path);
@@ -667,9 +813,16 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         dirType: DirType.download,
         dirName: DirName.download,
       );
-      if (info != null) _toast('Guardado en Descargas/sbox');
+      if (info != null) {
+        _toast('Guardado en Descargas/sbox');
+      } else {
+        _toast('No se pudo copiar a Descargas');
+      }
     } catch (_) {
-      // Sin acceso a Descargas: se abre desde la copia interna igualmente.
+      // Sin acceso a Descargas: se abre desde la copia interna igualmente,
+      // pero avisamos — si no, el archivo "desaparece" para quien lo busque
+      // directo en Descargas.
+      _toast('No se pudo copiar a Descargas');
     } finally {
       // Si MediaStore no llegó a borrar el temporal (p. ej. falló antes),
       // limpiarlo para no dejar basura en la caché.
@@ -707,18 +860,38 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   /// Lee un archivo del disco por su ruta y lo envía al otro dispositivo.
   /// Comprueba el tamaño ANTES de cargarlo en memoria (a prueba de errores).
+  ///
+  /// Único punto por el que pasa TODO envío de archivo (picker, cámara,
+  /// portapapeles automático, compartir, arrastrar-soltar — todos encolan
+  /// acá vía [_sendFilePath]): por eso es también el lugar correcto para
+  /// prender el indicador de "enviando", en vez de repetirlo en cada
+  /// llamador (así aparece en los mismos términos en cualquier camino).
   Future<void> _doSendFilePath(String path) async {
     final name = path.split('/').last;
+    if (mounted) {
+      setState(() {
+        _sending = true;
+        _sendingName = name;
+        _sendingProgress = 0;
+      });
+    }
+    _sendProgressSub = _link?.sendProgress.listen((p) {
+      if (mounted) setState(() => _sendingProgress = p);
+    });
     try {
       final file = File(path);
       if (await file.length() > _maxFileBytes) {
         _toast('«$name» es muy grande (máx ${_fmtSize(_maxFileBytes)})');
         return;
       }
-      _link?.sendFile(name, await file.readAsBytes());
+      await _link?.sendFile(name, file);
       _toast('Enviado: $name');
     } catch (_) {
       _toast('No se pudo enviar el archivo');
+    } finally {
+      await _sendProgressSub?.cancel();
+      _sendProgressSub = null;
+      if (mounted) setState(() => _sending = false);
     }
   }
 
@@ -871,10 +1044,24 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   }
 
   Future<void> _logout() async {
+    _stopClipboardWatch(); // si no, el timer de 2s sigue corriendo para siempre
     await _stopBgService(); // botón rojo: cortar también el servicio de 2º plano
     await _stateSub?.cancel();
     await _msgSub?.cancel();
     await _fileSub?.cancel();
+    await _sendProgressSub?.cancel();
+    // Si había una recepción en curso, no dejar el sink/temporal colgando —
+    // el próximo _sweepOldFiles() lo limpiaría igual, pero mejor cerrarlo ya.
+    await _incomingSink?.close();
+    _incomingSink = null;
+    if (_incomingTempPath != null) {
+      try {
+        await File(_incomingTempPath!).delete();
+      } catch (_) {}
+    }
+    _incomingTempPath = null;
+    _incomingName = null;
+    _incomingDiscard = false;
     await _hostSub?.cancel();
     await _advertiser?.stop();
     await _browser?.stop();
@@ -910,11 +1097,13 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _stateSub?.cancel();
     _msgSub?.cancel();
     _fileSub?.cancel();
+    _sendProgressSub?.cancel();
+    _incomingSink?.close();
     _hostSub?.cancel();
     _shareSub?.cancel();
     _connSub?.cancel();
     _clipboardWatch?.cancel();
-    for (final t in _imageDeletions) {
+    for (final t in _scheduledDeletions) {
       t.cancel();
     }
     _advertiser?.stop();
@@ -1245,6 +1434,10 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
               }, color: cAccent),
             ],
           ),
+          if (_sending) ...[
+            const SizedBox(height: 8),
+            _sendingStatus(),
+          ],
           const SizedBox(height: 10),
           Row(
             children: [
@@ -1262,7 +1455,10 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
                   icon: Icons.copy,
                   onTap: _shared == null
                       ? null
-                      : () => Clipboard.setData(ClipboardData(text: _shared!)),
+                      : () {
+                          Clipboard.setData(ClipboardData(text: _shared!));
+                          _toast('Copiado');
+                        },
                 ),
               ),
             ],
@@ -1310,6 +1506,28 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         padding: const EdgeInsets.all(8),
         child: Icon(icon, size: 18, color: color),
       ),
+    );
+  }
+
+  /// % real de progreso, confirmado por los acuses que manda el otro lado —
+  /// texto simple, sin barra visual (ver [_doSendFilePath]).
+  Widget _sendingStatus() {
+    return Row(
+      children: [
+        const SizedBox(
+          width: 14,
+          height: 14,
+          child: CircularProgressIndicator(strokeWidth: 2, color: cDim),
+        ),
+        const SizedBox(width: 10),
+        Flexible(
+          child: Text(
+            'Enviando «${_sendingName ?? ''}»… ${(_sendingProgress * 100).round()}%',
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: cDim, fontSize: 12),
+          ),
+        ),
+      ],
     );
   }
 

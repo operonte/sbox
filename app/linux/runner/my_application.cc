@@ -7,6 +7,8 @@
 
 #include <cstring>
 
+#include <sys/statvfs.h>
+
 #include "flutter/generated_plugin_registrant.h"
 
 struct _MyApplication {
@@ -16,6 +18,9 @@ struct _MyApplication {
   // herramientas externas como wl-clipboard). Métodos "getImagePng" (leer) y
   // "setImagePng" (dejar una imagen recibida en el portapapeles).
   FlMethodChannel* clipboard_channel;
+  // Canal nativo para consultar espacio libre en disco antes de aceptar un
+  // archivo grande. Método "getFreeBytes" (recibe una carpeta, string).
+  FlMethodChannel* diskspace_channel;
 };
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
@@ -104,6 +109,38 @@ static void clipboard_method_call_cb(FlMethodChannel* channel,
   }
 }
 
+// Devuelve los bytes libres en el filesystem que contiene la carpeta pasada
+// como argumento (o null si la carpeta no existe o statvfs falla) — usado
+// para chequear espacio antes de aceptar un archivo grande.
+static void diskspace_method_call_cb(FlMethodChannel* channel,
+                                     FlMethodCall* method_call,
+                                     gpointer user_data) {
+  g_autoptr(FlMethodResponse) response = nullptr;
+  if (strcmp(fl_method_call_get_name(method_call), "getFreeBytes") == 0) {
+    FlValue* args = fl_method_call_get_args(method_call);
+    const gchar* path = (args != nullptr &&
+                          fl_value_get_type(args) == FL_VALUE_TYPE_STRING)
+                             ? fl_value_get_string(args)
+                             : nullptr;
+    struct statvfs st;
+    if (path != nullptr && statvfs(path, &st) == 0) {
+      int64_t free_bytes =
+          (int64_t)st.f_bavail * (int64_t)st.f_frsize;
+      response = FL_METHOD_RESPONSE(
+          fl_method_success_response_new(fl_value_new_int(free_bytes)));
+    } else {
+      response = FL_METHOD_RESPONSE(
+          fl_method_success_response_new(fl_value_new_null()));
+    }
+  } else {
+    response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  }
+  g_autoptr(GError) error = nullptr;
+  if (!fl_method_call_respond(method_call, response, &error)) {
+    g_warning("sbox diskspace: respuesta fallida: %s", error->message);
+  }
+}
+
 // Called when first Flutter frame received.
 static void first_frame_cb(MyApplication* self, FlView* view) {
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
@@ -167,6 +204,13 @@ static void my_application_activate(GApplication* application) {
   fl_method_channel_set_method_call_handler(
       self->clipboard_channel, clipboard_method_call_cb, self, nullptr);
 
+  // Canal nativo de espacio libre en disco — statvfs, libc estándar.
+  self->diskspace_channel = fl_method_channel_new(
+      fl_engine_get_binary_messenger(fl_view_get_engine(view)),
+      "sbox/diskspace", FL_METHOD_CODEC(codec));
+  fl_method_channel_set_method_call_handler(
+      self->diskspace_channel, diskspace_method_call_cb, self, nullptr);
+
   gtk_widget_grab_focus(GTK_WIDGET(view));
 }
 
@@ -214,6 +258,7 @@ static void my_application_dispose(GObject* object) {
   MyApplication* self = MY_APPLICATION(object);
   g_clear_pointer(&self->dart_entrypoint_arguments, g_strfreev);
   g_clear_object(&self->clipboard_channel);
+  g_clear_object(&self->diskspace_channel);
   G_OBJECT_CLASS(my_application_parent_class)->dispose(object);
 }
 
@@ -238,7 +283,9 @@ MyApplication* my_application_new() {
   // Instancia única (antes NON_UNIQUE, que permitía dos cajas a la vez). Con los
   // flags por defecto, un segundo lanzamiento reenvía "activate" a la instancia
   // viva (ver my_application_activate) en vez de arrancar otro host.
+  // G_APPLICATION_DEFAULT_FLAGS (GLib 2.74+) reemplaza a G_APPLICATION_FLAGS_NONE,
+  // deprecado — ya disponible en la GLib instalada.
   return MY_APPLICATION(g_object_new(my_application_get_type(),
                                      "application-id", APPLICATION_ID, "flags",
-                                     G_APPLICATION_FLAGS_NONE, nullptr));
+                                     G_APPLICATION_DEFAULT_FLAGS, nullptr));
 }

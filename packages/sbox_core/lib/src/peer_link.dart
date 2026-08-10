@@ -8,6 +8,15 @@ import 'messages.dart';
 /// Puerto fijo del host sbox (para poder conectarse escribiendo solo la IP).
 const int kSboxPort = 47718;
 
+/// Tamaño de cada pedazo al enviar un archivo: mantiene la memoria acotada
+/// sin importar cuán grande sea el archivo (no se carga entero en RAM).
+const int _kChunkSize = 256 * 1024;
+
+/// Cada cuánto manda el receptor un acuse de progreso mientras llegan los
+/// pedazos de un archivo — no uno por cada pedazo (un archivo de 2 GB son
+/// miles de pedazos), alcanza con una actualización fluida para la UI.
+const Duration _kProgressAckInterval = Duration(milliseconds: 250);
+
 enum PeerStatus { idle, listening, connecting, connected, rejected, error }
 
 /// Estado del enlace entre las dos cajas.
@@ -33,17 +42,46 @@ class PeerState {
   factory PeerState.error(String m) => PeerState(PeerStatus.error, message: m);
 }
 
+/// Eventos de un archivo entrante, en el orden en que ocurren: una cabecera,
+/// varios pedazos de datos, y por último si se completó bien o no.
+sealed class FileEvent {}
+
+/// Llegó la cabecera de un archivo nuevo — antes de cualquier byte.
+class FileStarted extends FileEvent {
+  FileStarted(this.name, this.size);
+  final String name;
+  final int size;
+}
+
+/// Un pedazo de bytes del archivo actualmente en recepción.
+class FileData extends FileEvent {
+  FileData(this.bytes);
+  final Uint8List bytes;
+}
+
+/// Terminó de llegar el archivo — [ok] es false si la conexión se cortó a
+/// mitad de camino (archivo incompleto, hay que descartarlo).
+class FileFinished extends FileEvent {
+  FileFinished(this.ok);
+  final bool ok;
+}
+
 /// Interfaz común para host y cliente.
 abstract class PeerLink {
   Stream<SboxMessage> get messages;
 
-  /// Archivos completos recibidos (cabecera + bytes ya emparejados).
-  Stream<ReceivedFile> get files;
+  /// Eventos del archivo actualmente en recepción (cabecera → pedazos → fin).
+  Stream<FileEvent> get fileEvents;
   Stream<PeerState> get state;
+
+  /// Progreso (0.0–1.0) del envío de archivo en curso, confirmado por el
+  /// acuse del otro lado — no hay valor mientras no hay ningún envío activo.
+  Stream<double> get sendProgress;
   void send(SboxMessage message);
 
-  /// Envía un archivo: una trama de cabecera (texto) y otra con los bytes.
-  void sendFile(String name, List<int> bytes);
+  /// Envía un archivo leyéndolo del disco en pedazos: la memoria usada no
+  /// depende del tamaño del archivo.
+  Future<void> sendFile(String name, File file);
   Future<void> dispose();
 }
 
@@ -61,6 +99,21 @@ Future<List<String>> localIPv4() async {
     }
   }
   return result;
+}
+
+/// Envía [file] por [sink] en pedazos de [_kChunkSize], sin cargarlo entero
+/// en memoria. Reutilizado por host y cliente (misma lógica de envío).
+Future<void> _streamFileTo(void Function(List<int>) sink, File file) async {
+  final raf = await file.open();
+  try {
+    while (true) {
+      final chunk = await raf.read(_kChunkSize);
+      if (chunk.isEmpty) break;
+      sink(chunk);
+    }
+  } finally {
+    await raf.close();
+  }
 }
 
 /// El host (la PC): levanta un servidor WebSocket en la LAN y atiende a un
@@ -86,10 +139,21 @@ class SboxHost implements PeerLink {
 
   HttpServer? _server;
   WebSocket? _peer;
-  SboxMessage? _pendingFile; // cabecera a la espera de su trama binaria
+
+  // Archivo actualmente en recepción (null si no hay ninguno en curso).
+  bool _receivingFile = false;
+  int _recvTotal = 0;
+  int _recvSoFar = 0;
+  DateTime? _lastAckSent;
+
+  // Tamaño del archivo actualmente en envío (para calcular el % con los
+  // acuses que manda el otro lado).
+  int? _sendTotal;
+
   final _messages = StreamController<SboxMessage>.broadcast();
-  final _files = StreamController<ReceivedFile>.broadcast();
+  final _fileEvents = StreamController<FileEvent>.broadcast();
   final _state = StreamController<PeerState>.broadcast();
+  final _sendProgress = StreamController<double>.broadcast();
 
   /// Reemplaza el conjunto de tokens de confianza (p. ej. tras "olvidar" un
   /// dispositivo en Configuración). Si el peer conectado ahora mismo usaba un
@@ -112,9 +176,11 @@ class SboxHost implements PeerLink {
   @override
   Stream<SboxMessage> get messages => _messages.stream;
   @override
-  Stream<ReceivedFile> get files => _files.stream;
+  Stream<FileEvent> get fileEvents => _fileEvents.stream;
   @override
   Stream<PeerState> get state => _state.stream;
+  @override
+  Stream<double> get sendProgress => _sendProgress.stream;
 
   /// Arranca el servidor. Devuelve el puerto usado.
   Future<int> start({int port = kSboxPort}) async {
@@ -142,9 +208,9 @@ class SboxHost implements PeerLink {
     _log('teléfono abrió el socket; esperando código…');
     ws.listen(
       (raw) {
-        // Trama binaria: son los bytes del archivo cuya cabecera ya llegó.
+        // Trama binaria: un pedazo de los bytes del archivo en curso.
         if (raw is! String) {
-          _absorbBinary(raw);
+          _onBinaryChunk(raw);
           return;
         }
         final msg = SboxMessage.tryDecode(raw);
@@ -179,7 +245,9 @@ class SboxHost implements PeerLink {
           _log('texto recibido (${msg.content?.length ?? 0} chars)');
           _messages.add(msg);
         } else if (msg.type == SboxMsgType.fileHeader) {
-          _pendingFile = msg; // los bytes vienen en la siguiente trama
+          _startReceivingFile(msg.name, msg.size);
+        } else if (msg.type == SboxMsgType.fileProgress) {
+          _onProgressAck(msg.received);
         } else if (msg.type != SboxMsgType.ping) {
           _messages.add(msg);
         }
@@ -196,22 +264,58 @@ class SboxHost implements PeerLink {
     );
   }
 
-  /// Empareja una trama binaria con la última cabecera de archivo recibida.
-  void _absorbBinary(dynamic raw) {
-    final header = _pendingFile;
-    _pendingFile = null;
-    if (header == null) return;
+  void _startReceivingFile(String? name, int size) {
+    _receivingFile = true;
+    _recvTotal = size;
+    _recvSoFar = 0;
+    _lastAckSent = null;
+    _fileEvents.add(FileStarted(name ?? 'archivo', size));
+  }
+
+  /// Suma un pedazo binario al archivo en curso de recepción, avisa a quien
+  /// escucha y manda un acuse de progreso (con throttle) al emisor.
+  void _onBinaryChunk(dynamic raw) {
+    if (!_receivingFile) return; // trama inesperada sin cabecera: se ignora
     final bytes = raw is Uint8List ? raw : Uint8List.fromList(raw as List<int>);
-    // A prueba de fallos: si los bytes no coinciden con el tamaño anunciado,
-    // el archivo llegó truncado/desincronizado → se descarta (no se guarda
-    // algo corrupto haciéndolo pasar por completo).
-    if (header.size > 0 && bytes.length != header.size) {
-      _log('archivo descartado: ${header.name} (${bytes.length} de '
-          '${header.size} bytes)');
+    _recvSoFar += bytes.length;
+    // A prueba de fallos: si se pasó del tamaño anunciado (no debería pasar,
+    // TCP entrega en orden, pero es la misma cautela que ya existía) se
+    // descarta en vez de dejar pasar algo desincronizado.
+    if (_recvTotal > 0 && _recvSoFar > _recvTotal) {
+      _log('archivo descartado: llegaron más bytes de los anunciados');
+      _receivingFile = false;
+      _fileEvents.add(FileFinished(false));
       return;
     }
-    _log('archivo recibido: ${header.name} (${bytes.length} bytes)');
-    _files.add(ReceivedFile(name: header.name ?? 'archivo', bytes: bytes));
+    _fileEvents.add(FileData(bytes));
+    if (_recvTotal > 0 && _recvSoFar >= _recvTotal) {
+      _receivingFile = false;
+      _log('archivo recibido completo ($_recvSoFar bytes)');
+      _sendProgressAck(); // acuse final, sin throttle: asegura que llegue el 100%
+      _fileEvents.add(FileFinished(true));
+    } else {
+      _maybeSendProgressAck();
+    }
+  }
+
+  void _maybeSendProgressAck() {
+    final now = DateTime.now();
+    if (_lastAckSent != null && now.difference(_lastAckSent!) < _kProgressAckInterval) {
+      return;
+    }
+    _sendProgressAck();
+  }
+
+  void _sendProgressAck() {
+    _lastAckSent = DateTime.now();
+    send(SboxMessage.fileProgress(received: _recvSoFar));
+  }
+
+  void _onProgressAck(int received) {
+    final total = _sendTotal;
+    if (total != null && total > 0) {
+      _sendProgress.add((received / total).clamp(0.0, 1.0));
+    }
   }
 
   void _log(String m) {
@@ -222,7 +326,13 @@ class SboxHost implements PeerLink {
   void _onPeerGone() {
     _peer = null;
     _peerToken = null;
-    _pendingFile = null;
+    // Si había un archivo a medio recibir, avisar que quedó incompleto para
+    // que quien escucha borre lo que haya escrito hasta ahora.
+    if (_receivingFile) {
+      _receivingFile = false;
+      _fileEvents.add(FileFinished(false));
+    }
+    _sendTotal = null;
     if (!_state.isClosed) _state.add(PeerState.listening);
   }
 
@@ -230,9 +340,16 @@ class SboxHost implements PeerLink {
   void send(SboxMessage message) => _peer?.add(message.encode());
 
   @override
-  void sendFile(String name, List<int> bytes) {
-    _peer?.add(SboxMessage.fileHeader(name: name, size: bytes.length).encode());
-    _peer?.add(bytes);
+  Future<void> sendFile(String name, File file) async {
+    final size = await file.length();
+    _sendTotal = size;
+    _sendProgress.add(0.0);
+    send(SboxMessage.fileHeader(name: name, size: size));
+    try {
+      await _streamFileTo((chunk) => _peer?.add(chunk), file);
+    } finally {
+      _sendTotal = null;
+    }
   }
 
   @override
@@ -240,8 +357,9 @@ class SboxHost implements PeerLink {
     await _peer?.close();
     await _server?.close(force: true);
     await _messages.close();
-    await _files.close();
+    await _fileEvents.close();
     await _state.close();
+    await _sendProgress.close();
   }
 }
 
@@ -252,7 +370,13 @@ class SboxClient implements PeerLink {
   final String deviceName;
 
   WebSocket? _ws;
-  SboxMessage? _pendingFile; // cabecera a la espera de su trama binaria
+
+  // Archivo actualmente en recepción (mismo esquema que en SboxHost).
+  bool _receivingFile = false;
+  int _recvTotal = 0;
+  int _recvSoFar = 0;
+  DateTime? _lastAckSent;
+  int? _sendTotal;
 
   // Reconexión: recuerda a quién estaba conectado y reintenta si se cae.
   String? _host;
@@ -267,15 +391,18 @@ class SboxClient implements PeerLink {
   Timer? _reconnectTimer;
 
   final _messages = StreamController<SboxMessage>.broadcast();
-  final _files = StreamController<ReceivedFile>.broadcast();
+  final _fileEvents = StreamController<FileEvent>.broadcast();
   final _state = StreamController<PeerState>.broadcast();
+  final _sendProgress = StreamController<double>.broadcast();
 
   @override
   Stream<SboxMessage> get messages => _messages.stream;
   @override
-  Stream<ReceivedFile> get files => _files.stream;
+  Stream<FileEvent> get fileEvents => _fileEvents.stream;
   @override
   Stream<PeerState> get state => _state.stream;
+  @override
+  Stream<double> get sendProgress => _sendProgress.stream;
 
   /// [token]: si ya emparejamos antes con este host, el token que nos dio la
   /// última vez — así entra directo, sin pedir [code].
@@ -313,9 +440,9 @@ class SboxClient implements PeerLink {
       );
       ws.listen(
         (raw) {
-          // Trama binaria: bytes del archivo cuya cabecera ya llegó.
+          // Trama binaria: un pedazo de los bytes del archivo en curso.
           if (raw is! String) {
-            _absorbBinary(raw);
+            _onBinaryChunk(raw);
             return;
           }
           final msg = SboxMessage.tryDecode(raw);
@@ -332,7 +459,9 @@ class SboxClient implements PeerLink {
             _token = msg.token ?? _token;
             _state.add(PeerState.connected(msg.device ?? 'PC', token: _token));
           } else if (msg.type == SboxMsgType.fileHeader) {
-            _pendingFile = msg;
+            _startReceivingFile(msg.name, msg.size);
+          } else if (msg.type == SboxMsgType.fileProgress) {
+            _onProgressAck(msg.received);
           } else if (msg.type != SboxMsgType.ping) {
             _messages.add(msg);
           }
@@ -382,21 +511,62 @@ class SboxClient implements PeerLink {
     _reconnectTimer = Timer(Duration(seconds: secs), _open);
   }
 
-  /// Empareja una trama binaria con la última cabecera de archivo recibida.
-  void _absorbBinary(dynamic raw) {
-    final header = _pendingFile;
-    _pendingFile = null;
-    if (header == null) return;
+  void _startReceivingFile(String? name, int size) {
+    _receivingFile = true;
+    _recvTotal = size;
+    _recvSoFar = 0;
+    _lastAckSent = null;
+    _fileEvents.add(FileStarted(name ?? 'archivo', size));
+  }
+
+  /// Suma un pedazo binario al archivo en curso de recepción, avisa a quien
+  /// escucha y manda un acuse de progreso (con throttle) al emisor.
+  void _onBinaryChunk(dynamic raw) {
+    if (!_receivingFile) return;
     final bytes = raw is Uint8List ? raw : Uint8List.fromList(raw as List<int>);
-    // A prueba de fallos: descarta el archivo si los bytes no coinciden con el
-    // tamaño anunciado (llegó truncado o desincronizado).
-    if (header.size > 0 && bytes.length != header.size) return;
-    _files.add(ReceivedFile(name: header.name ?? 'archivo', bytes: bytes));
+    _recvSoFar += bytes.length;
+    if (_recvTotal > 0 && _recvSoFar > _recvTotal) {
+      _receivingFile = false;
+      _fileEvents.add(FileFinished(false));
+      return;
+    }
+    _fileEvents.add(FileData(bytes));
+    if (_recvTotal > 0 && _recvSoFar >= _recvTotal) {
+      _receivingFile = false;
+      _sendProgressAck();
+      _fileEvents.add(FileFinished(true));
+    } else {
+      _maybeSendProgressAck();
+    }
+  }
+
+  void _maybeSendProgressAck() {
+    final now = DateTime.now();
+    if (_lastAckSent != null && now.difference(_lastAckSent!) < _kProgressAckInterval) {
+      return;
+    }
+    _sendProgressAck();
+  }
+
+  void _sendProgressAck() {
+    _lastAckSent = DateTime.now();
+    send(SboxMessage.fileProgress(received: _recvSoFar));
+  }
+
+  void _onProgressAck(int received) {
+    final total = _sendTotal;
+    if (total != null && total > 0) {
+      _sendProgress.add((received / total).clamp(0.0, 1.0));
+    }
   }
 
   void _onGone() {
     _ws = null;
-    _pendingFile = null;
+    if (_receivingFile) {
+      _receivingFile = false;
+      _fileEvents.add(FileFinished(false));
+    }
+    _sendTotal = null;
     if (_disposed || _rejected) return;
     if (_wasConnected) {
       // Caída tras haber estado conectado: avisar y reintentar solo.
@@ -411,9 +581,16 @@ class SboxClient implements PeerLink {
   void send(SboxMessage message) => _ws?.add(message.encode());
 
   @override
-  void sendFile(String name, List<int> bytes) {
-    _ws?.add(SboxMessage.fileHeader(name: name, size: bytes.length).encode());
-    _ws?.add(bytes);
+  Future<void> sendFile(String name, File file) async {
+    final size = await file.length();
+    _sendTotal = size;
+    _sendProgress.add(0.0);
+    send(SboxMessage.fileHeader(name: name, size: size));
+    try {
+      await _streamFileTo((chunk) => _ws?.add(chunk), file);
+    } finally {
+      _sendTotal = null;
+    }
   }
 
   @override
@@ -422,7 +599,8 @@ class SboxClient implements PeerLink {
     _reconnectTimer?.cancel();
     await _ws?.close();
     await _messages.close();
-    await _files.close();
+    await _fileEvents.close();
     await _state.close();
+    await _sendProgress.close();
   }
 }
