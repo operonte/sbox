@@ -1095,10 +1095,12 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
           allowWakeLock: true,
           allowWifiLock: true, // mantener la WiFi despierta para el socket LAN
           autoRunOnBoot: false,
-          // Si el usuario descarta la app de recientes, se corta el servicio
-          // (la conexión vive en el isolate principal, que muere ahí de todos
-          // modos). Mientras la app esté en 2º plano, sigue viva.
-          stopWithTask: true,
+          // La conexión debe seguir viva sin importar cómo se salga de la
+          // app (deslizar arriba o descartarla de recientes) — solo el botón
+          // rojo (o forzar el cierre desde Ajustes de Android) la corta de
+          // verdad. Antes se cortaba también al descartar de recientes
+          // (stopWithTask: true); el usuario prefirió que persista siempre.
+          stopWithTask: false,
         ),
       );
     } catch (_) {}
