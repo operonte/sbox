@@ -5,7 +5,7 @@ import 'dart:convert';
 /// tramas binarias con los bytes del archivo, en pedazos. `fileProgress` es
 /// el acuse que manda quien RECIBE de vuelta a quien envía, con cuánto lleva
 /// acumulado — así el emisor puede mostrar un % real, no adivinado.
-enum SboxMsgType { hello, welcome, text, fileHeader, fileProgress, ping }
+enum SboxMsgType { hello, welcome, text, fileHeader, fileProgress, clear, ping }
 
 /// Mensaje que viaja por el canal entre las dos cajas. Se serializa como JSON.
 class SboxMessage {
@@ -50,6 +50,10 @@ class SboxMessage {
   /// Acuse de recepción parcial de un archivo en curso.
   factory SboxMessage.fileProgress({required int received}) =>
       SboxMessage(SboxMsgType.fileProgress, {'received': received});
+
+  /// Botón "Limpiar": pide al otro lado que borre el texto compartido y el
+  /// archivo recibido, igual que hace localmente quien lo tocó.
+  factory SboxMessage.clear() => SboxMessage(SboxMsgType.clear);
 
   String? get content => data['content'] as String?;
   String? get code => data['code'] as String?;

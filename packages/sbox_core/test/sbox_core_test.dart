@@ -46,4 +46,9 @@ void main() {
     expect(progress!.type, SboxMsgType.fileProgress);
     expect(progress.received, 1024);
   });
+
+  test('clear hace round-trip por JSON', () {
+    final decoded = SboxMessage.tryDecode(SboxMessage.clear().encode());
+    expect(decoded!.type, SboxMsgType.clear);
+  });
 }

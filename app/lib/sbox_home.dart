@@ -141,6 +141,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   // Borrados de archivos recibidos programados en el PC (para cancelarlos al cerrar).
   final List<Timer> _scheduledDeletions = [];
+  // Borrado automático del texto compartido, mismo ajuste que los archivos
+  // (solo PC — en Android nada se borra solo, ver [_scheduleSharedTextDeletion]).
+  Timer? _sharedTextDeletion;
 
   bool _isImage(String name) {
     final dot = name.lastIndexOf('.');
@@ -258,7 +261,11 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         // El portapapeles del sistema ya tiene este valor porque lo pusimos
         // nosotros — que el próximo tick no lo trate como una copia nueva.
         _lastClipboardText = m.content;
+        _scheduleSharedTextDeletion();
         _updateWidget();
+      } else if (m.type == SboxMsgType.clear) {
+        // No reenviar: si lo hiciéramos, iría y volvería para siempre.
+        _clearShared(notifyPeer: false);
       }
     });
     _fileSub = link.fileEvents.listen((event) {
@@ -348,6 +355,50 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _link?.send(SboxMessage.text(text));
     _sharedAt = DateTime.now().millisecondsSinceEpoch;
     if (mounted) setState(() => _shared = text);
+    _scheduleSharedTextDeletion();
+  }
+
+  /// Reprograma el borrado automático del texto compartido (solo PC, mismo
+  /// ajuste 15/30/60s que ya usan las imágenes/archivos). Se llama cada vez
+  /// que [_shared] cambia, mandado o recibido.
+  void _scheduleSharedTextDeletion() {
+    _sharedTextDeletion?.cancel();
+    _sharedTextDeletion = null;
+    if (!isDesktop || !Settings.instance.autoDeleteImages.value) return;
+    final secs = Settings.instance.autoDeleteSeconds.value;
+    _sharedTextDeletion = Timer(Duration(seconds: secs), () {
+      if (mounted) setState(() => _shared = null);
+    });
+  }
+
+  /// Botón "Limpiar": borra el texto compartido y el archivo recibido en las
+  /// DOS cajas de una — acción explícita del usuario, a diferencia del
+  /// borrado automático (que en Android nunca corre solo).
+  Future<void> _clearShared({bool notifyPeer = true}) async {
+    _sharedTextDeletion?.cancel();
+    _sharedTextDeletion = null;
+    // Gana sobre cualquier mensaje de texto viejo que llegue cruzado después.
+    _sharedAt = DateTime.now().millisecondsSinceEpoch;
+    final path = _recvPath;
+    if (mounted) {
+      setState(() {
+        _shared = null;
+        _recvName = null;
+        _recvPath = null;
+        _recvSize = 0;
+      });
+    } else {
+      _shared = null;
+      _recvName = null;
+      _recvPath = null;
+      _recvSize = 0;
+    }
+    if (path != null) {
+      try {
+        await File(path).delete();
+      } catch (_) {}
+    }
+    if (notifyPeer) _link?.send(SboxMessage.clear());
   }
 
   Future<void> _sendClipboard() async {
@@ -1088,6 +1139,8 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
 
   Future<void> _logout() async {
     _stopClipboardWatch(); // si no, el timer de 2s sigue corriendo para siempre
+    _sharedTextDeletion?.cancel();
+    _sharedTextDeletion = null;
     await _stopBgService(); // botón rojo: cortar también el servicio de 2º plano
     await _stateSub?.cancel();
     await _msgSub?.cancel();
@@ -1147,6 +1200,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
     _shareSub?.cancel();
     _connSub?.cancel();
     _clipboardWatch?.cancel();
+    _sharedTextDeletion?.cancel();
     for (final t in _scheduledDeletions) {
       t.cancel();
     }
@@ -1421,6 +1475,8 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
                   style: const TextStyle(color: cOnline, fontSize: 13),
                 ),
               ),
+              if (_shared != null || _recvName != null)
+                _iconBtn(Icons.delete_sweep, _clearShared, color: cDim),
             ],
           ),
           if (_receiving) ...[
