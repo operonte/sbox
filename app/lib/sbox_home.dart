@@ -1521,16 +1521,60 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
                 borderRadius: BorderRadius.circular(12),
                 border: Border.all(color: cBorder),
               ),
-              child: SingleChildScrollView(
-                child: SelectableText(
-                  _shared?.isNotEmpty == true ? _shared! : 'Portapapeles vacío',
-                  style: TextStyle(
-                    color: _shared?.isNotEmpty == true ? Colors.white : cDim,
-                    fontFamily: fontMono,
-                    fontSize: 13,
-                    height: 1.4,
+              clipBehavior: Clip.hardEdge,
+              child: Stack(
+                children: [
+                  // Marca de agua (solo Android): recuerda que deslizar hacia
+                  // arriba no cierra sbox, solo lo manda al fondo — la
+                  // conexión sigue viva (stopWithTask: false).
+                  if (!isDesktop) ...[
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: Align(
+                          alignment: const Alignment(0, -0.25),
+                          child: Opacity(
+                            opacity: 0.12,
+                            child: Icon(
+                              Icons.arrow_upward_rounded,
+                              size: 130,
+                              color: cAccent,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 10,
+                      child: IgnorePointer(
+                        child: Opacity(
+                          opacity: 0.4,
+                          child: Text(
+                            'Desliza hacia arriba para salir',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: cDim,
+                              fontFamily: fontMono,
+                              fontSize: 10.5,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                  SingleChildScrollView(
+                    child: SelectableText(
+                      _shared?.isNotEmpty == true ? _shared! : 'Portapapeles vacío',
+                      style: TextStyle(
+                        color: _shared?.isNotEmpty == true ? Colors.white : cDim,
+                        fontFamily: fontMono,
+                        fontSize: 13,
+                        height: 1.4,
+                      ),
+                    ),
                   ),
-                ),
+                ],
               ),
             ),
           ),
