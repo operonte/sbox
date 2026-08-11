@@ -896,11 +896,12 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   /// conservamos la copia interna, que es la que usan «Ver» y «Compartir».
   Future<void> _saveToDownloads(String path) async {
     String? tmp;
+    final fileName = path.split('/').last;
     try {
       MediaStore.appFolder = 'sbox';
       await MediaStore.ensureInitialized();
       final cache = await getTemporaryDirectory();
-      tmp = '${cache.path}/${path.split('/').last}';
+      tmp = '${cache.path}/$fileName';
       await File(path).copy(tmp);
       final info = await MediaStore().saveFile(
         tempFilePath: tmp,
@@ -910,13 +911,13 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
       if (info != null) {
         _toast('Guardado en Descargas/sbox');
       } else {
-        _toast('No se pudo copiar a Descargas');
+        await _confirmSavedOrWarn(fileName);
       }
     } catch (_) {
       // Sin acceso a Descargas: se abre desde la copia interna igualmente,
       // pero avisamos — si no, el archivo "desaparece" para quien lo busque
-      // directo en Descargas.
-      _toast('No se pudo copiar a Descargas');
+      // directo en Descargas. Antes de avisar, confirmar de verdad.
+      await _confirmSavedOrWarn(fileName);
     } finally {
       // Si MediaStore no llegó a borrar el temporal (p. ej. falló antes),
       // limpiarlo para no dejar basura en la caché.
@@ -927,6 +928,27 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         } catch (_) {}
       }
     }
+  }
+
+  /// `MediaStore.saveFile` a veces devuelve null (o tira una excepción)
+  /// aunque el archivo SÍ haya quedado guardado — puede pedir permiso al
+  /// sistema para sobreescribir en paralelo, y esa parte se resuelve después
+  /// de que este Future ya había "fallado". Antes de asustar con un error
+  /// falso, esperar un instante y confirmar si de verdad no está.
+  Future<void> _confirmSavedOrWarn(String fileName) async {
+    await Future.delayed(const Duration(seconds: 2));
+    try {
+      final uri = await MediaStore().getFileUri(
+        fileName: fileName,
+        dirType: DirType.download,
+        dirName: DirName.download,
+      );
+      if (uri != null) {
+        _toast('Guardado en Descargas/sbox');
+        return;
+      }
+    } catch (_) {}
+    _toast('No se pudo copiar a Descargas');
   }
 
   void _toast(String msg) {
