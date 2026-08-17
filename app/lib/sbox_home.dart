@@ -99,6 +99,8 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   final _sendCtrl = TextEditingController();
   // Cola de envío de archivos: uno a la vez y en orden (ver [_sendFilePath]).
   Future<void> _sendQueue = Future<void>.value();
+  // Cola de recepción: mantiene cabecera → bytes → fin estrictamente en orden.
+  Future<void> _fileQueue = Future<void>.value();
 
   StreamSubscription<PeerState>? _stateSub;
   StreamSubscription<SboxMessage>? _msgSub;
@@ -110,8 +112,9 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   StreamSubscription<List<ConnectivityResult>>? _connSub;
 
   // Compartido por «Compartir → sbox» mientras aún no había conexión (se manda
-  // al conectar). Archivos por ruta y textos/URLs por separado.
-  final List<String> _pendingSharePaths = [];
+  // al conectar). Archivos por ruta+nombre a usar (ver [_batchName]) y
+  // textos/URLs por separado.
+  final List<(String path, String name)> _pendingSharePaths = [];
   final List<String> _pendingShareTexts = [];
 
   // Servicio en primer plano (Android): mantiene la conexión viva en 2º plano.
@@ -268,15 +271,22 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
         _clearShared(notifyPeer: false);
       }
     });
+    // Los eventos se procesan EN ORDEN y de a uno: [_onFileStarted] es
+    // asíncrono (tiene que resolver la carpeta destino antes de poder abrir
+    // el archivo), así que sin encadenarlos los bytes que llegan mientras
+    // tanto se escribirían sobre un destino todavía nulo — y se perderían en
+    // silencio, dejando un archivo corrupto o un «.part» vacío.
     _fileSub = link.fileEvents.listen((event) {
-      switch (event) {
-        case FileStarted(:final name, :final size):
-          _onFileStarted(name, size);
-        case FileData(:final bytes):
-          _onFileData(bytes);
-        case FileFinished(:final ok):
-          _onFileFinished(ok);
-      }
+      _fileQueue = _fileQueue.then((_) async {
+        switch (event) {
+          case FileStarted(:final name, :final size):
+            await _onFileStarted(name, size);
+          case FileData(:final bytes):
+            _onFileData(bytes);
+          case FileFinished(:final ok):
+            await _onFileFinished(ok);
+        }
+      }).catchError((_) {}); // un fallo no corta el resto de la transferencia
     });
   }
 
@@ -492,28 +502,26 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   }
 
   // ----------------------------------------------------------------- archivos
-  /// Elige un archivo (cualquier tipo) y lo envía al otro dispositivo.
-  /// En escritorio usa el diálogo GTK nativo; en Android el selector del sistema.
+  /// Elige uno o varios archivos (cualquier tipo) y los envía al otro
+  /// dispositivo, en orden. En escritorio usa el diálogo GTK nativo; en
+  /// Android el selector del sistema.
   Future<void> _pickAndSendFile() async {
     if (!_connected || _sending) return;
-    String? path;
+    List<String> paths;
     try {
       if (isDesktop) {
-        path = (await fsel.openFile())?.path;
+        paths = (await fsel.openFiles()).map((f) => f.path).toList();
       } else {
-        final result = await FilePicker.platform.pickFiles();
-        if (result != null && result.files.length > 1) {
-          _toast('Elegí solo un archivo');
-          return;
-        }
-        path = result?.files.single.path;
+        final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+        paths = result?.files.map((f) => f.path).whereType<String>().toList() ??
+            const [];
       }
     } catch (e) {
       _toast('No se pudo leer el archivo');
       return;
     }
-    if (path == null) return;
-    await _sendFilePath(path); // _doSendFilePath prende/apaga _sending solo
+    if (paths.isEmpty) return;
+    await _sendFileBatch(paths); // _doSendFilePath prende/apaga _sending solo
   }
 
   /// Cámara (Android): tomar una foto o grabar un video y enviarlo al otro
@@ -965,11 +973,31 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   }
 
   // ----------------------------------------------------- compartir / drag&drop
+  /// Nombre con el que se manda el archivo en [path]: si va solo ([total] 1)
+  /// conserva su nombre real; si va en un grupo de varios, se cataloga por
+  /// posición con su propia extensión (1.jpg, 2.png, 3.opus…) — así no
+  /// importa cómo se llamaban originalmente ni si se repiten entre sí.
+  String _batchName(String path, int index, int total) {
+    final original = path.split('/').last;
+    if (total <= 1) return original;
+    final dot = original.lastIndexOf('.');
+    final hasExt = dot > 0 && dot < original.length - 1;
+    return hasExt ? '${index + 1}${original.substring(dot)}' : '${index + 1}';
+  }
+
+  /// Envía varios archivos juntos, uno a la vez y en orden (ver
+  /// [_sendFilePath]), catalogándolos con [_batchName].
+  Future<void> _sendFileBatch(List<String> paths) async {
+    for (var i = 0; i < paths.length; i++) {
+      await _sendFilePath(paths[i], name: _batchName(paths[i], i, paths.length));
+    }
+  }
+
   /// Envía un archivo por su ruta, encolado: un envío a la vez y en orden. Así
   /// no se cargan varios archivos grandes en memoria al mismo tiempo (p. ej. al
   /// compartir o soltar varios juntos) — a prueba de errores frente a OOM.
-  Future<void> _sendFilePath(String path) {
-    final task = _sendQueue.then((_) => _doSendFilePath(path));
+  Future<void> _sendFilePath(String path, {String? name}) {
+    final task = _sendQueue.then((_) => _doSendFilePath(path, name: name));
     _sendQueue = task.catchError((_) {}); // un fallo no corta la cola
     return task;
   }
@@ -982,8 +1010,8 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   /// acá vía [_sendFilePath]): por eso es también el lugar correcto para
   /// prender el indicador de "enviando", en vez de repetirlo en cada
   /// llamador (así aparece en los mismos términos en cualquier camino).
-  Future<void> _doSendFilePath(String path) async {
-    final name = path.split('/').last;
+  Future<void> _doSendFilePath(String path, {String? name}) async {
+    name ??= path.split('/').last;
     if (mounted) {
       setState(() {
         _sending = true;
@@ -1012,22 +1040,34 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
   }
 
   /// Llega contenido por «Compartir → sbox». Si hay conexión, se envía; si no,
-  /// se guarda en cola y se manda al conectar.
+  /// se guarda en cola y se manda al conectar. Los archivos compartidos JUNTOS
+  /// en la misma acción se tratan como un solo lote (ver [_batchName]).
   void _onShared(List<SharedMediaFile> files) {
     if (files.isEmpty) return;
-    var queued = false;
-    for (final f in files) {
-      // Para texto/URL, `path` trae el contenido en sí.
-      final isText =
-          f.type == SharedMediaType.text || f.type == SharedMediaType.url;
-      if (_connected) {
-        isText ? _send(f.path) : _sendFilePath(f.path);
-      } else {
-        (isText ? _pendingShareTexts : _pendingSharePaths).add(f.path);
-        queued = true;
+    // Para texto/URL, `path` trae el contenido en sí.
+    final texts = files
+        .where((f) => f.type == SharedMediaType.text || f.type == SharedMediaType.url)
+        .map((f) => f.path)
+        .toList();
+    final filePaths = files
+        .where((f) => f.type != SharedMediaType.text && f.type != SharedMediaType.url)
+        .map((f) => f.path)
+        .toList();
+    if (_connected) {
+      for (final t in texts) {
+        _send(t);
+      }
+      unawaited(_sendFileBatch(filePaths));
+    } else {
+      _pendingShareTexts.addAll(texts);
+      for (var i = 0; i < filePaths.length; i++) {
+        _pendingSharePaths
+            .add((filePaths[i], _batchName(filePaths[i], i, filePaths.length)));
+      }
+      if (texts.isNotEmpty || filePaths.isNotEmpty) {
+        _toast('Conéctate y se enviará lo compartido');
       }
     }
-    if (queued) _toast('Conéctate y se enviará lo compartido');
   }
 
   void _flushPendingShares() {
@@ -1040,10 +1080,10 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
       }
     }
     if (_pendingSharePaths.isNotEmpty) {
-      final paths = List<String>.from(_pendingSharePaths);
+      final pending = List<(String, String)>.from(_pendingSharePaths);
       _pendingSharePaths.clear();
-      for (final p in paths) {
-        _sendFilePath(p);
+      for (final (path, name) in pending) {
+        _sendFilePath(path, name: name);
       }
     }
   }
@@ -1054,9 +1094,7 @@ class _SboxHomeState extends State<SboxHome> with WidgetsBindingObserver {
       _toast('Conéctate primero para enviar');
       return;
     }
-    for (final file in detail.files) {
-      await _sendFilePath(file.path);
-    }
+    await _sendFileBatch(detail.files.map((f) => f.path).toList());
   }
 
   /// Empuja el estado y el último contenido al widget de inicio (solo Android).

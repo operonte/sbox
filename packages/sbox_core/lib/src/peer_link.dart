@@ -106,9 +106,18 @@ Future<List<String>> localIPv4() async {
 Future<void> _streamFileTo(void Function(List<int>) sink, File file) async {
   final raf = await file.open();
   try {
+    var any = false;
     while (true) {
       final chunk = await raf.read(_kChunkSize);
-      if (chunk.isEmpty) break;
+      if (chunk.isEmpty) {
+        // Un archivo de 0 bytes no tiene ningún pedazo real que mandar, pero
+        // igual se manda uno vacío: si no, el receptor no recibe NINGUNA
+        // trama binaria y se queda esperando el fin para siempre (ver el
+        // chequeo de fin en _onBinaryChunk).
+        if (!any) sink(chunk);
+        break;
+      }
+      any = true;
       sink(chunk);
     }
   } finally {
@@ -288,7 +297,7 @@ class SboxHost implements PeerLink {
       return;
     }
     _fileEvents.add(FileData(bytes));
-    if (_recvTotal > 0 && _recvSoFar >= _recvTotal) {
+    if (_recvSoFar >= _recvTotal) {
       _receivingFile = false;
       _log('archivo recibido completo ($_recvSoFar bytes)');
       _sendProgressAck(); // acuse final, sin throttle: asegura que llegue el 100%
@@ -531,7 +540,7 @@ class SboxClient implements PeerLink {
       return;
     }
     _fileEvents.add(FileData(bytes));
-    if (_recvTotal > 0 && _recvSoFar >= _recvTotal) {
+    if (_recvSoFar >= _recvTotal) {
       _receivingFile = false;
       _sendProgressAck();
       _fileEvents.add(FileFinished(true));
